@@ -87,6 +87,7 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         """Record positions newly unmasked in this step."""
         dllm_block_length = self.dllm_block_length
         start_block = start_offset // dllm_block_length
+        touched_blocks = set()
         for idx, (pre, new) in enumerate(zip(prev_mask, new_mask)):
             if pre == DLLM_MASKED and new == DLLM_UNMASKED:
                 block_idx = start_block + idx // dllm_block_length
@@ -95,7 +96,9 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
                     self._resize_decode_order(block_idx + 1)
                 step = self._decode_steps[block_idx]
                 self.decode_order[block_idx][pos] = step
-                self._decode_steps[block_idx] = step + 1
+                touched_blocks.add(block_idx)
+        for b in touched_blocks:
+            self._decode_steps[b] += 1
 
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
