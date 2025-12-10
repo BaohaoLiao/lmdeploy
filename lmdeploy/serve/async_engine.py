@@ -89,6 +89,8 @@ class GenOut:
     history_token_len: int
     input_token_len: int
     generate_token_len: int
+    prompt: Any = None
+    prompt_token_ids: Any = None
     finish_reason: Optional[Literal['stop', 'length', 'error']] = None
     token_ids: List[int] = None
     logprobs: List[Dict[int, float]] = None
@@ -104,6 +106,8 @@ def _gen_out_to_response(out: GenOut, index) -> Response:
     return Response(text=out.response,
                     generate_token_len=out.generate_token_len,
                     input_token_len=out.input_token_len,
+                    prompt=out.prompt,
+                    prompt_token_ids=out.prompt_token_ids,
                     finish_reason=out.finish_reason,
                     token_ids=out.token_ids or [],
                     logprobs=out.logprobs,
@@ -120,6 +124,10 @@ def _append_response(dst: Response, src: Response):
     dst.text += src.text
     dst.generate_token_len = src.generate_token_len
     dst.input_token_len = src.input_token_len
+    if src.prompt is not None:
+        dst.prompt = src.prompt
+    if src.prompt_token_ids is not None:
+        dst.prompt_token_ids = src.prompt_token_ids
     dst.finish_reason = src.finish_reason
     dst.index = src.index
     if src.token_ids:
@@ -159,6 +167,10 @@ class Session:
         resp.input_token_len = step.input_token_len
         resp.generate_token_len = step.generate_token_len
         resp.finish_reason = step.finish_reason
+        if getattr(step, 'prompt', None) is not None:
+            resp.prompt = step.prompt
+        if getattr(step, 'prompt_token_ids', None) is not None:
+            resp.prompt_token_ids = step.prompt_token_ids
         if getattr(step, 'decode_order', None) is not None:
             resp.decode_order = step.decode_order
         return resp
@@ -824,7 +836,13 @@ class AsyncEngine(LogitsMixin):
             gen_config.max_new_tokens = max(0, self.session_len - self.id2step[session_id] - len(input_ids))
             if gen_config.max_new_tokens == 0:
                 logger.error(f'run out of tokens. session={session_id}.')
-                yield GenOut('', self.id2step[session_id], len(input_ids), 0, 'length')
+                yield GenOut('',
+                             self.id2step[session_id],
+                             len(input_ids),
+                             0,
+                             'length',
+                             prompt=prompt_input.get('prompt', None),
+                             prompt_token_ids=input_ids)
                 if sequence_end is True and sequence_start is False:
                     await self.end_session(session_id)
                 return
@@ -836,6 +854,8 @@ class AsyncEngine(LogitsMixin):
                          history_token_len=self.id2step[session_id],
                          input_token_len=len(input_ids),
                          generate_token_len=0,
+                         prompt=prompt_input.get('prompt', None),
+                         prompt_token_ids=input_ids,
                          finish_reason='error',
                          token_ids=[])
             return
@@ -848,6 +868,7 @@ class AsyncEngine(LogitsMixin):
             stop_ids = gen_config.stop_token_ids or []
 
         metrics_processor.increment_total_requests()
+        processed_prompt = prompt_input.get('prompt', None)
         async with self.model_inst(session_id) as inst:
             token_ids = input_ids.copy()
             history_len = self.id2step[session_id]
@@ -897,6 +918,8 @@ class AsyncEngine(LogitsMixin):
                                  history_len,
                                  input_len,
                                  gen_len,
+                                 prompt=processed_prompt,
+                                 prompt_token_ids=input_ids,
                                  finish_reason,
                                  token_ids=res,
                                  cache_block_ids=outputs.cache_block_ids,
@@ -938,6 +961,8 @@ class AsyncEngine(LogitsMixin):
                                  self.id2step[session_id],
                                  len(input_ids),
                                  gen_len,
+                                 prompt=processed_prompt,
+                                 prompt_token_ids=input_ids,
                                  finish_reason,
                                  token_ids=token_ids,
                                  logprobs=logprobs,
@@ -958,6 +983,8 @@ class AsyncEngine(LogitsMixin):
                                  history_token_len=self.id2step[session_id],
                                  input_token_len=len(input_ids),
                                  generate_token_len=0,
+                                 prompt=processed_prompt,
+                                 prompt_token_ids=input_ids,
                                  finish_reason='error',
                                  token_ids=[])
             # update step

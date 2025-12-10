@@ -437,6 +437,8 @@ class Response:
         generate_token_len (int): the response token length.
         input_token_len (int): the input prompt token length. Note that it may
             contains chat template part.
+        prompt (str): processed prompt string (after chat template if applied).
+        prompt_token_ids (List[int]): tokenized prompt ids (after chat template if applied).
         session_id (int): the id for running the session.
         finish_reason ('stop' | 'length' | None): the reason the model stopped
             generating tokens. This will be 'stop' if the model hit a natural
@@ -451,6 +453,8 @@ class Response:
     text: str
     generate_token_len: int
     input_token_len: int
+    prompt: str = None
+    prompt_token_ids: List[int] = None
     finish_reason: Optional[Literal['stop', 'length']] = None
     token_ids: List[int] = field(default_factory=list)
     logprobs: List[Dict[int, float]] = None
@@ -464,7 +468,8 @@ class Response:
         hidden_state = (
             'last_hidden_state=None' if self.last_hidden_state is None else
             f'last_hidden_state.shape={self.last_hidden_state.shape}\nlast_hidden_state={self.last_hidden_state}')
-        s = (f'text={self.text}\ngenerate_token_len={self.generate_token_len}\nfinish_reason="{self.finish_reason}"\n'
+        s = (f'text={self.text}\nprompt={self.prompt}\nprompt_token_ids={self.prompt_token_ids}\n'
+             f'generate_token_len={self.generate_token_len}\nfinish_reason="{self.finish_reason}"\n'
              f'token_ids={self.token_ids}\nlog_probs={self.logprobs}\ndecode_order={self.decode_order}\n'
              f'{logits}\n{hidden_state}')
         return s
