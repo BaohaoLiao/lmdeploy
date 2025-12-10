@@ -920,7 +920,7 @@ class AsyncEngine(LogitsMixin):
                                  gen_len,
                                  prompt=processed_prompt,
                                  prompt_token_ids=input_ids,
-                                 finish_reason,
+                                 finish_reason=finish_reason,
                                  token_ids=res,
                                  cache_block_ids=outputs.cache_block_ids,
                                  decode_order=outputs.decode_order)
@@ -963,7 +963,7 @@ class AsyncEngine(LogitsMixin):
                                  gen_len,
                                  prompt=processed_prompt,
                                  prompt_token_ids=input_ids,
-                                 finish_reason,
+                                 finish_reason=finish_reason,
                                  token_ids=token_ids,
                                  logprobs=logprobs,
                                  logits=logits,
