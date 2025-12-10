@@ -36,7 +36,7 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
     history_dllm_mask: HistoryDLLMMask = field(default_factory=HistoryDLLMMask)
     # Decode order per block; each block stores step index when position is unmasked
     decode_order: List[List[int]] = field(default_factory=list)
-    _decode_step: int = 0
+    _decode_steps: List[int] = field(default_factory=list)
 
     def __post_init__(self):
         """Post init."""
@@ -73,13 +73,15 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         return self._strategy.dllm_mask_token
 
     def _resize_decode_order(self, num_blocks: int):
-        """Sync decode_order length with blocks, filling unset with -1."""
+        """Sync decode_order and per-block step counters."""
         cur = len(self.decode_order)
         block_len = self.dllm_block_length
         if cur > num_blocks:
             self.decode_order = self.decode_order[:num_blocks]
+            self._decode_steps = self._decode_steps[:num_blocks]
         elif cur < num_blocks:
             self.decode_order.extend([[-1] * block_len for _ in range(num_blocks - cur)])
+            self._decode_steps.extend([0 for _ in range(num_blocks - cur)])
 
     def _record_decode_order(self, start_offset: int, prev_mask: np.ndarray, new_mask: np.ndarray):
         """Record positions newly unmasked in this step."""
@@ -91,8 +93,9 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
                 pos = int(idx % dllm_block_length)
                 if block_idx >= len(self.decode_order):
                     self._resize_decode_order(block_idx + 1)
-                self.decode_order[block_idx][pos] = self._decode_step
-        self._decode_step += 1
+                step = self._decode_steps[block_idx]
+                self.decode_order[block_idx][pos] = step
+                self._decode_steps[block_idx] = step + 1
 
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
@@ -178,6 +181,7 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             self._num_history_ids += self._num_token_ids
             self._num_token_ids = dllm_block_length
             self.decode_order.append([-1] * dllm_block_length)
+            self._decode_steps.append(0)
 
     def _update_token_ids_prefill(self, token_ids: np.ndarray, dllm_mask: np.ndarray):
         """Update token ids for prefill."""
