@@ -148,6 +148,8 @@ class EngineOutputGather:
         output = self.get(stream_id)
         output.token_ids.extend(result.token_ids or [])
         output.logprobs.extend(result.logprobs or [])
+        if result.decode_order is not None:
+            output.decode_order = result.decode_order
 
     def pop(self, stream_id, result):
         if not isinstance(result, EngineOutput):
@@ -155,4 +157,6 @@ class EngineOutputGather:
         output = self._output.pop(stream_id)
         result.token_ids = output.token_ids or []
         result.logprobs = output.logprobs or None
+        if output.decode_order is not None:
+            result.decode_order = output.decode_order
         return result

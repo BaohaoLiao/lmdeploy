@@ -94,6 +94,7 @@ class GenOut:
     logprobs: List[Dict[int, float]] = None
     logits: Any = None
     last_hidden_state: Any = None
+    decode_order: Any = None
 
     # for disaggregation
     cache_block_ids: List[int] = None
@@ -108,6 +109,7 @@ def _gen_out_to_response(out: GenOut, index) -> Response:
                     logprobs=out.logprobs,
                     last_hidden_state=out.last_hidden_state,
                     logits=out.logits,
+                    decode_order=out.decode_order,
                     index=index)
 
 
@@ -125,6 +127,8 @@ def _append_response(dst: Response, src: Response):
     if src.logprobs:
         dst.logprobs = dst.logprobs or []
         dst.logprobs += src.logprobs
+    if src.decode_order is not None:
+        dst.decode_order = src.decode_order
     return dst
 
 
@@ -155,6 +159,8 @@ class Session:
         resp.input_token_len = step.input_token_len
         resp.generate_token_len = step.generate_token_len
         resp.finish_reason = step.finish_reason
+        if getattr(step, 'decode_order', None) is not None:
+            resp.decode_order = step.decode_order
         return resp
 
     @property
@@ -893,7 +899,8 @@ class AsyncEngine(LogitsMixin):
                                  gen_len,
                                  finish_reason,
                                  token_ids=res,
-                                 cache_block_ids=outputs.cache_block_ids)
+                                 cache_block_ids=outputs.cache_block_ids,
+                                 decode_order=outputs.decode_order)
                     if outputs.logprobs is not None:
                         out.logprobs = (outputs.logprobs[:-hit_stop_token] if hit_stop_token else outputs.logprobs)
                     if outputs.last_hidden_state is not None:
@@ -936,7 +943,8 @@ class AsyncEngine(LogitsMixin):
                                  logprobs=logprobs,
                                  logits=logits,
                                  last_hidden_state=last_hidden_state,
-                                 cache_block_ids=outputs.cache_block_ids)
+                                 cache_block_ids=outputs.cache_block_ids,
+                                 decode_order=outputs.decode_order)
                     # Update a session's sequence only when it is in finished status
                     if outputs.status == ResponseType.FINISH:
                         if rewind_stop_tokens:

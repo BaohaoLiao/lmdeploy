@@ -53,6 +53,7 @@ class InferOutput:
     # send cache blocks back for migration in Disaggregated LLM Serving
     # when Prefill Engine is Done.
     cache_block_ids: List[int] = None
+    decode_order: Any = None
 
     # for logging
     req_metrics: RequestMetrics = None
@@ -871,13 +872,17 @@ class Engine(EngineBase):
                 cur_logprobs = (logprobs.vals[idx][:num_logprobs + 1], logprobs.indices[idx][:num_logprobs + 1])
 
             req_metrics = RequestMetrics(new_token_timestamp, msg.engine_events)
+            decode_order = getattr(msg, 'decode_order', None)
+            if decode_order is not None:
+                decode_order = [list(order) for order in decode_order]
             out = InferOutput(session_id=session_id,
                               resp=msg.resp,
                               finish=finish,
                               token_ids=token_ids,
                               cache_block_ids=cache_block_ids,
                               req_metrics=req_metrics,
-                              logprobs=cur_logprobs)
+                              logprobs=cur_logprobs,
+                              decode_order=decode_order)
             outputs[session_id] = out
 
             if msg.return_logits:
@@ -967,6 +972,7 @@ class Engine(EngineBase):
             self._response(out.resp,
                            resp_type,
                            data=dict(token_ids=out.token_ids,
+                                     decode_order=out.decode_order,
                                      logits=out.logits,
                                      cache_block_ids=out.cache_block_ids,
                                      req_metrics=out.req_metrics,

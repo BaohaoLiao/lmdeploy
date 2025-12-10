@@ -34,6 +34,8 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
     # For dllm
     history_dllm_mask: HistoryDLLMMask = field(default_factory=HistoryDLLMMask)
+    # Decode order of each block, collected when tokens are unmasked
+    decode_order: List[List[int]] = field(default_factory=list)
 
     def __post_init__(self):
         """Post init."""
@@ -69,11 +71,33 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
     def dllm_mask_token(self):
         return self._strategy.dllm_mask_token
 
+    def _resize_decode_order(self, num_blocks: int):
+        """Sync decode_order length with blocks."""
+        cur = len(self.decode_order)
+        if cur > num_blocks:
+            self.decode_order = self.decode_order[:num_blocks]
+        elif cur < num_blocks:
+            self.decode_order.extend([[] for _ in range(num_blocks - cur)])
+
+    def _record_decode_order(self, start_offset: int, prev_mask: np.ndarray, new_mask: np.ndarray):
+        """Record positions newly unmasked in this step."""
+        dllm_block_length = self.dllm_block_length
+        start_block = start_offset // dllm_block_length
+        for idx, (pre, new) in enumerate(zip(prev_mask, new_mask)):
+            if pre == DLLM_MASKED and new == DLLM_UNMASKED:
+                block_idx = start_block + idx // dllm_block_length
+                if block_idx >= len(self.decode_order):
+                    self.decode_order.extend([[] for _ in range(block_idx - len(self.decode_order) + 1)])
+                self.decode_order[block_idx].append(int(idx % dllm_block_length))
+
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
         val = dllm_block_length - pos - 1
         self._num_valid_ids -= val
         self.num_new_tokens -= val
+        if len(self.decode_order) > 0:
+            last_block_idx = len(self.decode_order) - 1
+            self.decode_order[last_block_idx] = [p for p in self.decode_order[last_block_idx] if p <= pos]
 
     def _update_token_ids_inputs(self, token_ids: np.ndarray, dllm_mask: np.ndarray):
         """Append tokens."""
@@ -82,6 +106,9 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         dllm_mask_token = self.dllm_mask_token
         new_token_ids = [token_ids]
         new_dllm_mask = [dllm_mask]
+        prev_decode_order = self.decode_order
+        history_blocks = self.num_history_ids // dllm_block_length
+        prev_total_blocks = len(prev_decode_order)
 
         # add uncached tokens in token_ids
         # for example, [cccc cccc uumm], the [uu] in last block is remain valid.
@@ -94,6 +121,10 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             self.history_cache.resize(self.num_history_ids)
             self.history_dllm_mask.resize(self.num_history_ids)
             num_tokens += num_remain_valid
+        # decode order for history + remaining valid blocks
+        remain_blocks = (num_remain_valid + dllm_block_length - 1) // dllm_block_length if num_remain_valid else 0
+        remain_orders = prev_decode_order[prev_total_blocks - remain_blocks:] if remain_blocks > 0 else []
+        base_orders = prev_decode_order[:history_blocks]
 
         # pad to align with dllm_block_length
         num_pad = (-num_tokens) % dllm_block_length
@@ -110,6 +141,12 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
         self.history_cache.append(token_ids)
         self.history_dllm_mask.append(dllm_mask)
+        num_new_blocks = len(token_ids) // dllm_block_length
+        new_orders = base_orders + remain_orders
+        new_orders.extend([[] for _ in range(max(0, num_new_blocks - len(remain_orders)))])
+        target_blocks = history_blocks + num_new_blocks
+        self.decode_order = new_orders[:target_blocks]
+        self._resize_decode_order(target_blocks)
         self.output_start_pos = self._num_valid_ids + len(token_ids)
         self._num_valid_ids = self.num_history_ids + num_tokens
         self._num_token_ids = len(token_ids)
@@ -122,10 +159,12 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         dllm_mask_token = self.dllm_mask_token
         assert num_tokens % dllm_block_length == 0
         num_history_ids = self.num_history_ids
+        prev_mask = self.history_dllm_mask[num_history_ids:].copy()
 
         token_ids[dllm_mask == DLLM_MASKED] = dllm_mask_token
         self.history_cache[num_history_ids:] = token_ids
         self.history_dllm_mask[num_history_ids:] = dllm_mask
+        self._record_decode_order(num_history_ids, prev_mask, dllm_mask)
 
         # check if all blocks are cached
         last_mask = dllm_mask[-dllm_block_length:]
@@ -145,6 +184,7 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             self.history_dllm_mask.append(new_dllm_mask)
             self._num_history_ids += self._num_token_ids
             self._num_token_ids = dllm_block_length
+            self.decode_order.append([])
 
     def _update_token_ids_prefill(self, token_ids: np.ndarray, dllm_mask: np.ndarray):
         """Update token ids for prefill."""
