@@ -81,4 +81,5 @@ class DLLMStrategyFactory(StrategyFactoryBase):
     def build_sequence_strategy(self) -> SequenceStrategy:
         from .sequence import DLLMSequenceStrategy
         return DLLMSequenceStrategy(block_size=self.dllm_block_length,
-                                    dllm_mask_token=self.model_config.dllm_mask_token)
+                                    dllm_mask_token=self.model_config.dllm_mask_token,
+                                    denoising_steps=self.dllm_config.denoising_steps)

@@ -88,6 +88,9 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         dllm_block_length = self.dllm_block_length
         start_block = start_offset // dllm_block_length
         touched_blocks = set()
+        max_step_idx = None
+        if self._strategy.denoising_steps is not None:
+            max_step_idx = max(0, self._strategy.denoising_steps - 1)
         for idx, (pre, new) in enumerate(zip(prev_mask, new_mask)):
             if pre == DLLM_MASKED and new == DLLM_UNMASKED:
                 block_idx = start_block + idx // dllm_block_length
@@ -95,10 +98,13 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
                 if block_idx >= len(self.decode_order):
                     self._resize_decode_order(block_idx + 1)
                 step = self._decode_steps[block_idx]
+                if max_step_idx is not None:
+                    step = min(step, max_step_idx)
                 self.decode_order[block_idx][pos] = step
                 touched_blocks.add(block_idx)
         for b in touched_blocks:
-            self._decode_steps[b] += 1
+            if max_step_idx is None or self._decode_steps[b] < max_step_idx:
+                self._decode_steps[b] += 1
 
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
@@ -236,9 +242,10 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
 class DLLMSequenceStrategy(SequenceStrategy):
 
-    def __init__(self, block_size: int, dllm_mask_token: int) -> None:
+    def __init__(self, block_size: int, dllm_mask_token: int, denoising_steps: int) -> None:
         self.block_size = block_size
         self.dllm_mask_token = dllm_mask_token
+        self.denoising_steps = denoising_steps
 
     def make_sequence(self,
                       seq_id: int,
