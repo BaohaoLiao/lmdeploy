@@ -79,6 +79,7 @@ class InferenceConfig:
     cache_max_entry_count: float = 0.97
     max_prefill_token_num: int = 4096
     gen_max_new_tokens: int = 32000  # used in session length, then removed
+    per_question_time_limit: Optional[float] = None  # seconds; falls back to dynamic budget if None
 
 
 @dataclass
@@ -102,6 +103,8 @@ class ActorGenConfig:
 class ActorConfig:
     gen_cfg: ActorGenConfig
     prompt_list: List[PromptConfig]
+    boxed_frequency_threshold: int = 3
+    callback_every_n_tokens: int = 20
 
 
 @dataclass
@@ -187,6 +190,23 @@ class TimeManager:
         if self._cutoffs:
             self._cutoffs.pop()
 
+    def question_time_budget(self, explicit_budget: Optional[float] = None) -> float:
+        """
+        Return the per-question time budget in seconds.
+        If an explicit budget is provided, use it; otherwise divide the
+        remaining global time by the remaining questions (as tracked by
+        remaining cutoffs) to distribute time evenly.
+        """
+        if explicit_budget is not None:
+            return max(float(explicit_budget), 0.0)
+
+        remaining_time = self.final_cutoff_time - time.time()
+        if remaining_time <= 0:
+            return 0.0
+
+        remaining_questions = max(len(self._cutoffs), 1)
+        return remaining_time / remaining_questions
+
 
 TIME_MANAGER = TimeManager()
 
@@ -247,6 +267,33 @@ class ResponseProcessor:
         r"\\boxed\s*{\s*([-+]?[0-9]*\.?[0-9]+)\s*}",
         flags=re.MULTILINE,
     )
+
+    @staticmethod
+    def extract_last_boxed_value(response: str) -> Optional[int]:
+        """
+        Extract the last \\boxed{} value without falling back to plain integers.
+        Returns None if no boxed answer is present.
+        """
+        if not response:
+            return None
+
+        matches = ResponseProcessor.BOXED_PATTERN.findall(response)
+        if not matches:
+            return None
+
+        content = matches[-1]
+        try:
+            num = int(content)
+        except ValueError:
+            try:
+                num = int(float(content))
+                if math.isinf(num):
+                    logger.warning("Parsed infinite boxed value from %s", content)
+                    return None
+            except (ValueError, OverflowError):
+                return None
+
+        return num % 100_000
 
     @staticmethod
     def extract_boxed_answer(response: str) -> Optional[int]:
@@ -312,6 +359,17 @@ class ResponseProcessor:
         return best_answer % 100_000
 
 
+@dataclass
+class StreamingResult:
+    parsed_answers: List[int] = field(default_factory=list)
+    answer_counts: Dict[int, int] = field(default_factory=dict)
+    token_lens: Dict[int, int] = field(default_factory=dict)
+    finish_reasons: Dict[int, Optional[str]] = field(default_factory=dict)
+    final_answer: Optional[int] = None
+    elapsed: float = 0.0
+    early_stop_reason: Optional[str] = None
+
+
 # ============================================================
 # Actor (Prompt Construction & Generation)
 # ============================================================
@@ -327,6 +385,8 @@ class Actor:
         self.gen_config = GenerationConfig(**self.gen_cfg.__dict__)
         self.reasoning_effort = CONFIG.main_model.reasoning_effort
         self.enable_thinking = CONFIG.main_model.enable_thinking
+        self.frequency_threshold = max(1, self.actor_cfg.boxed_frequency_threshold)
+        self.callback_every_n_tokens = max(1, self.actor_cfg.callback_every_n_tokens)
 
     def _build_messages(self, question: str, weight: float = 1.0) -> List[List[Dict[str, str]]]:
         """
@@ -355,32 +415,164 @@ class Actor:
                     )
         return prompts
 
-    def generate(self, question: str, weight: float = 1.0):
+    @staticmethod
+    def _stop_session(pipe, session_id: int) -> None:
         """
-        Generate multiple responses for a given question.
-        Returns: (responses, token_lengths, finish_reasons)
+        Stop a specific session via the lmdeploy pipeline.
         """
-        messages = self._build_messages(question, weight=weight)
+        if hasattr(pipe, "_run") and hasattr(pipe, "stop_session"):
+            try:
+                fut = pipe._run(coro=pipe.stop_session(session_id))
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to stop session %s early: %s", session_id, exc)
 
+    @staticmethod
+    def _stop_all_sessions(pipe) -> None:
+        """Stop all active sessions on the pipeline when we need to cut early."""
+        if hasattr(pipe, "_run") and hasattr(pipe, "stop_all_session"):
+            try:
+                fut = pipe._run(coro=pipe.stop_all_session())
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to stop sessions early: %s", exc)
+
+    def generate(self, question: str, weight: float = 1.0, time_budget: Optional[float] = None) -> StreamingResult:
+        """
+        Stream responses for a given question.
+        Uses \\boxed{} detection to stop early once a majority is reached or
+        when the per-question time budget is exceeded.
+        """
+        prompts = self._build_messages(question, weight=weight)
         pipe = get_pipeline()
-        outputs = pipe(
-            messages,
-            gen_config=self.gen_config,
-            reasoning_effort=self.reasoning_effort,
-            enable_thinking=self.enable_thinking,
-            use_tqdm=True,
+
+        sample_answers: Dict[int, int] = {}
+        answer_counts: Dict[int, int] = defaultdict(int)
+        token_lens: Dict[int, int] = defaultdict(int)
+        finish_reasons: Dict[int, Optional[str]] = {}
+
+        final_answer: Optional[int] = None
+        early_stop_reason: Optional[str] = None
+
+        start_time = time.time()
+        budget = None if time_budget is None else max(time_budget, 0.0)
+
+        for idx, prompt in enumerate(prompts):
+            if budget is not None and (time.time() - start_time) > budget:
+                early_stop_reason = "time_budget"
+                logger.info(
+                    "Early stop before sample %d: per-question time budget %.2fs exceeded (elapsed: %.2fs)",
+                    idx,
+                    budget,
+                    time.time() - start_time,
+                )
+                break
+
+            partial_text = ""
+            sample_answer: Optional[int] = None
+            last_callback_token = 0
+            session_id = next(pipe._session_id)
+            stream = pipe.stream_infer(
+                prompt,
+                gen_config=self.gen_config,
+                reasoning_effort=self.reasoning_effort,
+                enable_thinking=self.enable_thinking,
+                session_id=session_id,
+            )
+
+            try:
+                for resp in stream:
+                    # Budget check via callback cadence
+                    if resp.generate_token_len - last_callback_token >= self.callback_every_n_tokens:
+                        last_callback_token = resp.generate_token_len
+                        if budget is not None and (time.time() - start_time) > budget:
+                            early_stop_reason = "time_budget"
+                            logger.info(
+                                "Early stop during sample %d: per-question time budget %.2fs exceeded (elapsed: %.2fs)",
+                                idx,
+                                budget,
+                                time.time() - start_time,
+                            )
+                            self._stop_session(pipe, session_id)
+                            break
+
+                    if resp.text:
+                        partial_text += resp.text
+                        boxed_val = ResponseProcessor.extract_last_boxed_value(partial_text)
+                        if boxed_val is not None:
+                            sample_answer = boxed_val
+                            token_lens[idx] = resp.generate_token_len
+                            finish_reasons[idx] = resp.finish_reason or "boxed"
+                            logger.info("Callback stop sample %d: boxed answer %s detected", idx, boxed_val)
+                            self._stop_session(pipe, session_id)
+                            break
+
+                    token_lens[idx] = resp.generate_token_len
+                    if resp.finish_reason is not None:
+                        finish_reasons[idx] = resp.finish_reason
+
+                    # Inline time check in case callbacks didn't fire
+                    if budget is not None and (time.time() - start_time) > budget:
+                        early_stop_reason = "time_budget"
+                        logger.info(
+                            "Early stop during sample %d: per-question time budget %.2fs exceeded (elapsed: %.2fs)",
+                            idx,
+                            budget,
+                            time.time() - start_time,
+                        )
+                        self._stop_session(pipe, session_id)
+                        break
+            finally:
+                if hasattr(stream, "close"):
+                    try:
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            # If we hit time budget during the sample, stop processing further samples.
+            if early_stop_reason == "time_budget":
+                break
+
+            # Fallback: attempt to parse boxed (or last integer) from the accumulated text if none was found mid-stream.
+            if sample_answer is None:
+                sample_answer = ResponseProcessor.extract_boxed_answer(partial_text)
+                if sample_answer is not None and finish_reasons.get(idx) is None:
+                    finish_reasons[idx] = "parsed_after_stream"
+
+            if sample_answer is not None:
+                sample_answers[idx] = sample_answer
+                answer_counts[sample_answer] += 1
+                if answer_counts[sample_answer] >= self.frequency_threshold:
+                    final_answer = sample_answer
+                    early_stop_reason = "frequency_threshold"
+                    logger.info(
+                        "Early stop overall: boxed answer %s reached frequency threshold %d",
+                        sample_answer,
+                        self.frequency_threshold,
+                    )
+                    # stop remaining active sessions if any
+                    self._stop_all_sessions(pipe)
+                    break
+
+        elapsed_total = time.time() - start_time
+
+        parsed_answers = list(sample_answers.values())
+
+        if final_answer is None:
+            if parsed_answers:
+                final_answer = ResponseProcessor.answer_aggregator(parsed_answers)
+            else:
+                final_answer = None
+
+        return StreamingResult(
+            parsed_answers=parsed_answers,
+            answer_counts=dict(answer_counts),
+            token_lens=dict(token_lens),
+            finish_reasons=finish_reasons,
+            final_answer=final_answer,
+            elapsed=elapsed_total,
+            early_stop_reason=early_stop_reason,
         )
-
-        responses: List[str] = []
-        token_lens: List[int] = []
-        finish_reasons: List[str] = []
-
-        for out in outputs:
-            responses.append(out.text)
-            token_lens.append(out.generate_token_len)
-            finish_reasons.append(out.finish_reason)
-
-        return responses, token_lens, finish_reasons
 
 
 # ============================================================
@@ -430,21 +622,38 @@ def predict(
     processor = ResponseProcessor()
     actor = Actor()
 
+    question_time_budget = TIME_MANAGER.question_time_budget(
+        CONFIG.inference_cfg.per_question_time_limit
+    )
+    logger.info("Decoding budget for this question: %.2f seconds", question_time_budget)
+
     # Weight adjustment near cutoff time
     weight = 1.0
     if TIME_MANAGER.should_downweight():
         weight = 0.66
 
     # Run generation
-    responses, gen_token_lens, finish_reasons = actor.generate(q_text, weight=weight)
+    gen_result = actor.generate(q_text, weight=weight, time_budget=question_time_budget)
 
     # Parse predictions
-    parsed_answers = [processor.extract_boxed_answer(r) for r in responses]
-    final_prediction = processor.answer_aggregator(parsed_answers)
+    parsed_answers = gen_result.parsed_answers
+    final_prediction = (
+        gen_result.final_answer
+        if gen_result.final_answer is not None
+        else processor.answer_aggregator(parsed_answers)
+    )
 
     logger.info("Raw parsed predictions: %s", parsed_answers)
-    logger.info("Response token lengths: %s", gen_token_lens)
-    logger.info("Finish reasons: %s", finish_reasons)
+    logger.info("Answer counts: %s", gen_result.answer_counts)
+    logger.info("Response token lengths: %s", gen_result.token_lens)
+    logger.info("Finish reasons: %s", gen_result.finish_reasons)
+    logger.info(
+        "Decoding elapsed time: %.2fs (budget: %.2fs)",
+        gen_result.elapsed,
+        question_time_budget,
+    )
+    if gen_result.early_stop_reason:
+        logger.info("Generation stopped early due to: %s", gen_result.early_stop_reason)
     logger.info("Final aggregated prediction: %s", final_prediction)
     logger.info("=" * 60)
 
