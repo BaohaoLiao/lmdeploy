@@ -161,6 +161,7 @@ class TimeManager:
     def __init__(self, total_hours: float = 4.75, early_minutes: float = 12.0, steps: int = 50):
         self.start_time: float = time.time()
         self.final_cutoff_time: float = self.start_time + total_hours * 3600
+        self.questions_served: int = 0
 
         # Create descending cutoff times from final_cutoff_time down to (start + early_minutes)
         cutoff_array = np.linspace(
@@ -189,6 +190,7 @@ class TimeManager:
         """Consume one cutoff per prediction call to mimic original pop behavior."""
         if self._cutoffs:
             self._cutoffs.pop()
+        self.questions_served += 1
 
     def question_time_budget(self, explicit_budget: Optional[float] = None) -> float:
         """
@@ -196,6 +198,7 @@ class TimeManager:
         If an explicit budget is provided, use it; otherwise divide the
         remaining global time by the remaining questions (as tracked by
         remaining cutoffs) to distribute time evenly.
+        The first 5 questions get an extra 2 minutes allowance if available.
         """
         if explicit_budget is not None:
             return max(float(explicit_budget), 0.0)
@@ -205,7 +208,14 @@ class TimeManager:
             return 0.0
 
         remaining_questions = max(len(self._cutoffs), 1)
-        return remaining_time / remaining_questions
+        base_budget = remaining_time / remaining_questions
+
+        # Give the first 5 questions an extra 2 minutes if possible
+        bonus = 120.0 if self.questions_served < 5 else 0.0
+        budget = base_budget + bonus
+
+        # Never exceed the total remaining time
+        return max(0.0, min(budget, remaining_time))
 
 
 TIME_MANAGER = TimeManager()
