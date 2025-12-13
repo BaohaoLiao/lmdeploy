@@ -33,6 +33,20 @@ import pandas as pd
 import polars as pl
 import torch
 from collections import defaultdict
+from openai import OpenAI
+from openai_harmony import (
+    HarmonyEncodingName,
+    load_harmony_encoding,
+    Conversation,
+    Message,
+    Role,
+    SystemContent,
+    ReasoningEffort,
+    RenderConversationConfig,
+    TextContent,
+    Author,
+    ToolNamespaceConfig,
+)
 
 from lmdeploy import pipeline as lm_pipeline, TurbomindEngineConfig, GenerationConfig
 import kaggle_evaluation.aimo_3_inference_server as aimo_server
@@ -113,10 +127,20 @@ class ActorConfig:
 
 
 @dataclass
+class OpenAIClientConfig:
+    base_url: str = "http://127.0.0.1:8000/v1"
+    api_key: str = "sk-local"
+    model_name: str = "gpt-oss"
+    max_model_len: int = 64000
+    request_timeout: float = 360.0
+
+
+@dataclass
 class AppConfig:
     main_model: ModelConfig
     inference_cfg: InferenceConfig
     actor: ActorConfig
+    client: OpenAIClientConfig
     exam_dataset_files: str
     output_path: str = "results"
     use_server_for_eval: bool = True
@@ -145,6 +169,7 @@ CONFIG = AppConfig(
             )
         ],
     ),
+    client=OpenAIClientConfig(),
     exam_dataset_files="/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv",
     output_path="results",
     use_server_for_eval=True,
@@ -387,22 +412,90 @@ class StreamingResult:
 
 
 # ============================================================
+# Python Tool (Harmony)
+# ============================================================
+
+
+class PythonTool:
+    """Lightweight Python execution tool for Harmony tool-calls."""
+
+    def __init__(self, timeout: float = 30.0):
+        self.timeout = timeout
+
+    @property
+    def name(self) -> str:
+        return "python"
+
+    @property
+    def tool_config(self) -> ToolNamespaceConfig:
+        return ToolNamespaceConfig(
+            name=self.name,
+            description="Execute Python code. Use print() to show results.",
+            tools=[],
+        )
+
+    @staticmethod
+    def _wrap_code(code: str) -> str:
+        prelude = "import math\nimport numpy as np\nimport sympy as sp\n"
+        lines = code.strip().split("\n")
+        if lines and not lines[-1].startswith("print(") and "print(" not in lines[-1]:
+            last = lines[-1]
+            if "#" in last:
+                last = last.split("#")[0]
+            lines[-1] = f"print({last})"
+        return prelude + "\n".join(lines)
+
+    def process_sync_plus(self, message: Message) -> List[Message]:
+        code = message.content[0].text if message.content else ""
+        wrapped = self._wrap_code(code)
+
+        import subprocess
+        try:
+            res = subprocess.run(
+                ["python3", "-u", "-c", wrapped],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+            output = res.stdout.strip()
+            if res.stderr:
+                output = (output + "\n" + res.stderr.strip()).strip()
+            if not output:
+                output = "[WARN] No output. Use print() to see results."
+        except subprocess.TimeoutExpired:
+            output = f"[ERROR] Execution timed out after {self.timeout}s."
+        except Exception as exc:  # noqa: BLE001
+            output = f"[ERROR] {exc}"
+
+        content = TextContent(text=output)
+        author = Author(role=Role.TOOL, name=self.name)
+        return [Message(author=author, content=[content]).with_recipient("assistant")]
+
+
+# ============================================================
 # Actor (Prompt Construction & Generation)
 # ============================================================
 
 class Actor:
     """
-    High-level interface for generating answers given a question.
+    High-level interface for generating answers given a question using Harmony tool-calls.
     """
 
     def __init__(self) -> None:
         self.actor_cfg = CONFIG.actor
         self.gen_cfg = self.actor_cfg.gen_cfg
-        self.gen_config = GenerationConfig(**self.gen_cfg.__dict__)
+        self.client_cfg = CONFIG.client
         self.reasoning_effort = CONFIG.main_model.reasoning_effort
         self.enable_thinking = CONFIG.main_model.enable_thinking
         self.frequency_threshold = max(1, self.actor_cfg.boxed_frequency_threshold)
         self.callback_every_n_tokens = max(1, self.actor_cfg.callback_every_n_tokens)
+        self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        self.stop_token_ids = self.encoding.stop_tokens_for_assistant_actions()
+        self.client = OpenAI(
+            base_url=self.client_cfg.base_url,
+            api_key=self.client_cfg.api_key,
+            timeout=self.client_cfg.request_timeout,
+        )
 
     def _determine_sample_count(self, time_budget: float) -> int:
         """
@@ -414,11 +507,11 @@ class Actor:
             return self.actor_cfg.low_budget_samples
         return self.actor_cfg.mid_budget_samples
 
-    def _build_messages(self, question: str, sample_count: int) -> List[List[Dict[str, str]]]:
+    def _build_messages(self, question: str, sample_count: int) -> List[str]:
         """
-        Build a list of chat message lists for the pipeline, one per sample.
+        Build a list of prompts (plain strings) for the Harmony client, one per sample.
         """
-        prompts: List[List[Dict[str, str]]] = []
+        prompts: List[str] = []
         sample_count = max(1, sample_count)
 
         base_total = sum(max(1, pcfg.number) for pcfg in self.actor_cfg.prompt_list)
@@ -427,158 +520,72 @@ class Actor:
             repeat = max(1, round(sample_count * max(1, pcfg.number) / base_total))
 
             for _ in range(repeat):
+                full_prompt = question + pcfg.user_suffix
                 if pcfg.system:
-                    prompts.append(
-                        [
-                            {"role": "system", "content": pcfg.system},
-                            {"role": "user", "content": question + pcfg.user_suffix},
-                        ]
-                    )
-                else:
-                    prompts.append(
-                        [
-                            {"role": "user", "content": question + pcfg.user_suffix},
-                        ]
-                    )
+                    full_prompt = pcfg.system + "\n" + full_prompt
+                prompts.append(full_prompt)
         return prompts
-
-    @staticmethod
-    def _stop_session(pipe, session_id: int) -> None:
-        """
-        Stop a specific session via the lmdeploy pipeline.
-        """
-        if hasattr(pipe, "_run") and hasattr(pipe, "stop_session"):
-            try:
-                fut = pipe._run(coro=pipe.stop_session(session_id))
-                fut.result()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to stop session %s early: %s", session_id, exc)
-
-    @staticmethod
-    def _stop_all_sessions(pipe) -> None:
-        """Stop all active sessions on the pipeline when we need to cut early."""
-        if hasattr(pipe, "_run") and hasattr(pipe, "stop_all_session"):
-            try:
-                fut = pipe._run(coro=pipe.stop_all_session())
-                fut.result()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to stop sessions early: %s", exc)
 
     def generate(self, question: str, time_budget: Optional[float] = None) -> StreamingResult:
         """
-        Stream responses for a given question.
+        Stream responses for a given question with Harmony tool-calls.
         Uses \\boxed{} detection to stop early once a majority is reached or
         when the per-question time budget is exceeded.
         """
         budget = time_budget if time_budget is not None else 0.0
         sample_count = self._determine_sample_count(budget)
         prompts = self._build_messages(question, sample_count=sample_count)
-        pipe = get_pipeline()
-
-        # Pre-allocate session ids so we can stop individual sessions later.
-        if hasattr(pipe, "_session_id"):
-            session_ids = [next(pipe._session_id) for _ in prompts]
-        else:
-            session_ids = list(range(len(prompts)))
-
-        def requests():
-            for prompt, sid in zip(prompts, session_ids):
-                yield dict(
-                    messages=prompt,
-                    gen_config=self.gen_config,
-                    do_preprocess=True,
-                    adapter_name=None,
-                    stream_response=True,
-                    sequence_start=True,
-                    sequence_end=True,
-                    session_id=sid,
-                    reasoning_effort=self.reasoning_effort,
-                    enable_thinking=self.enable_thinking,
-                )
-
-        stream = pipe._infer(requests(), multiplex=True)
-
         sample_answers: Dict[int, int] = {}
         answer_counts: Dict[int, int] = defaultdict(int)
-        token_lens: Dict[int, int] = defaultdict(int)
-        finish_reasons: Dict[int, Optional[str]] = {}
         partial_texts: Dict[int, str] = defaultdict(str)
-        last_callback_token: Dict[int, int] = defaultdict(int)
-        finished_indices: set[int] = set()
+        finish_reasons: Dict[int, Optional[str]] = {}
+        token_lens: Dict[int, int] = defaultdict(int)
 
         final_answer: Optional[int] = None
         early_stop_reason: Optional[str] = None
 
         start_time = time.time()
-        budget = None if time_budget is None else max(time_budget, 0.0)
+        deadline = start_time + budget if budget > 0 else None
 
-        try:
-            for resp in stream:
-                idx = resp.index
-                if idx in finished_indices:
-                    continue
+        python_tool = PythonTool(timeout=30.0)
 
-                token_lens[idx] = resp.generate_token_len
+        for idx, prompt in enumerate(prompts):
+            if deadline and time.time() > deadline:
+                early_stop_reason = "time_budget"
+                logger.info(
+                    "Early stop before sample %d: per-question time budget %.2fs exceeded",
+                    idx,
+                    budget,
+                )
+                break
 
-                # Periodic budget check based on token progress
-                if resp.generate_token_len - last_callback_token[idx] >= self.callback_every_n_tokens:
-                    last_callback_token[idx] = resp.generate_token_len
-                    if budget is not None and (time.time() - start_time) > budget:
-                        early_stop_reason = "time_budget"
-                        logger.info(
-                            "Early stop during sample %d: per-question time budget %.2fs exceeded (elapsed: %.2fs)",
-                            idx,
-                            budget,
-                            time.time() - start_time,
-                        )
-                        self._stop_all_sessions(pipe)
-                        break
+            response_text, tokens_generated, finish_reason = self._generate_single(
+                prompt,
+                python_tool,
+                deadline=deadline,
+            )
+            partial_texts[idx] = response_text
+            token_lens[idx] = tokens_generated
+            finish_reasons[idx] = finish_reason
 
-                if resp.text:
-                    partial_texts[idx] += resp.text
-                    boxed_val = ResponseProcessor.extract_last_boxed_value(partial_texts[idx])
-                    if boxed_val is not None:
-                        sample_answers[idx] = boxed_val
-                        answer_counts[boxed_val] += 1
-                        finish_reasons[idx] = resp.finish_reason or "boxed"
-                        finished_indices.add(idx)
-                        logger.info("Callback stop sample %d: boxed answer %s detected", idx, boxed_val)
-                        self._stop_session(pipe, session_ids[idx])
-
-                        if answer_counts[boxed_val] >= self.frequency_threshold:
-                            final_answer = boxed_val
-                            early_stop_reason = "frequency_threshold"
-                            logger.info(
-                                "Early stop overall: boxed answer %s reached frequency threshold %d",
-                                boxed_val,
-                                self.frequency_threshold,
-                            )
-                            self._stop_all_sessions(pipe)
-                            break
-
-                if resp.finish_reason is not None:
-                    finish_reasons[idx] = resp.finish_reason
-
-                # Inline budget check in case callbacks haven't triggered
-                if budget is not None and (time.time() - start_time) > budget:
-                    early_stop_reason = "time_budget"
+            boxed_val = ResponseProcessor.extract_last_boxed_value(response_text)
+            if boxed_val is not None:
+                sample_answers[idx] = boxed_val
+                answer_counts[boxed_val] += 1
+                logger.info("Sample %d boxed answer: %s", idx, boxed_val)
+                if answer_counts[boxed_val] >= self.frequency_threshold:
+                    final_answer = boxed_val
+                    early_stop_reason = "frequency_threshold"
                     logger.info(
-                        "Early stop during streaming: per-question time budget %.2fs exceeded (elapsed: %.2fs)",
-                        budget,
-                        time.time() - start_time,
+                        "Early stop overall: boxed answer %s reached frequency threshold %d",
+                        boxed_val,
+                        self.frequency_threshold,
                     )
-                    self._stop_all_sessions(pipe)
                     break
-        finally:
-            if hasattr(stream, "close"):
-                try:
-                    stream.close()
-                except Exception:  # noqa: BLE001
-                    pass
 
         elapsed_total = time.time() - start_time
 
-        # For any unfinished samples, try to parse whatever we have accumulated.
+        # Fallback parse for samples without boxed during streaming.
         for idx, text in partial_texts.items():
             if idx in sample_answers:
                 continue
@@ -589,7 +596,6 @@ class Actor:
                     finish_reasons[idx] = "parsed_after_stream"
 
         parsed_answers = list(sample_answers.values())
-
         if final_answer is None:
             if parsed_answers:
                 final_answer = ResponseProcessor.answer_aggregator(parsed_answers)
@@ -606,6 +612,104 @@ class Actor:
             elapsed=elapsed_total,
             early_stop_reason=early_stop_reason,
         )
+
+    def _generate_single(
+        self,
+        prompt: str,
+        python_tool: PythonTool,
+        deadline: Optional[float] = None,
+    ) -> tuple[str, int, Optional[str]]:
+        """
+        Run a single Harmony TIR generation with optional tool-calls.
+        """
+        messages = [
+            Message.from_role_and_content(
+                Role.SYSTEM,
+                SystemContent.new()
+                .with_reasoning_effort(ReasoningEffort.HIGH)
+                .with_tools(python_tool.tool_config),
+            ),
+            Message.from_role_and_content(Role.USER, prompt),
+        ]
+
+        text_buffer = ""
+        total_tokens = 0
+        finish_reason: Optional[str] = None
+
+        for _ in range(8):  # hard cap iterations to avoid loops
+            if deadline and time.time() >= deadline:
+                finish_reason = "time_budget"
+                break
+
+            prompt_ids = self.encoding.render_conversation_for_completion(
+                Conversation.from_messages(messages),
+                Role.ASSISTANT,
+            )
+
+            max_tokens = max(1, self.client_cfg.max_model_len - len(prompt_ids))
+            stream = self.client.completions.create(
+                model=self.client_cfg.model_name,
+                prompt=prompt_ids,
+                max_tokens=max_tokens,
+                temperature=self.gen_cfg.temperature,
+                top_p=self.gen_cfg.top_p,
+                stream=True,
+                extra_body={
+                    "stop_token_ids": self.stop_token_ids,
+                    "return_token_ids": True,
+                },
+            )
+
+            stream_text = ""
+            stream_tokens: List[int] = []
+
+            try:
+                for chunk in stream:
+                    token_chunk = chunk.choices[0].token_ids or []
+                    text_chunk = chunk.choices[0].text or ""
+
+                    if token_chunk:
+                        stream_tokens.extend(token_chunk)
+                        total_tokens += len(token_chunk)
+                    if text_chunk:
+                        stream_text += text_chunk
+
+                    if deadline and time.time() >= deadline:
+                        finish_reason = "time_budget"
+                        break
+
+                    if "}" in text_chunk:
+                        if ResponseProcessor.extract_last_boxed_value(stream_text) is not None:
+                            finish_reason = "boxed"
+                            break
+                stream.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Streaming error: %s", exc)
+                stream.close()
+                break
+
+            text_buffer += stream_text
+
+            parsed_msgs = self.encoding.parse_messages_from_completion_tokens(
+                stream_tokens,
+                Role.ASSISTANT,
+            )
+            if parsed_msgs:
+                messages.extend(parsed_msgs)
+                last_msg = messages[-1]
+                if last_msg.recipient == python_tool.name:
+                    tool_responses = python_tool.process_sync_plus(last_msg)
+                    messages.extend(tool_responses)
+                    continue
+
+            if finish_reason:
+                break
+
+            if not stream_tokens:
+                finish_reason = finish_reason or "stop"
+                break
+
+        return text_buffer, total_tokens, finish_reason
 
 
 # ============================================================
