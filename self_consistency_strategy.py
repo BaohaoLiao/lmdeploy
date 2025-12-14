@@ -27,7 +27,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # ============================================================
 # Third-Party Imports
@@ -65,6 +65,10 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+# Quiet noisy HTTP client logs (OpenAI/httpx/httpcore)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ============================================================
@@ -102,6 +106,8 @@ class VLLMServerConfig:
     stream_interval: int = 20
     start_server: bool = True
     log_path: str = "vllm.log"
+    speculative_config: Optional[str] = None
+    kv_cache_dtype: Optional[str] = None
 
 
 @dataclass
@@ -120,6 +126,8 @@ class GenerationConfig:
     low_budget_samples: int = 4
     high_budget_seconds: float = 300.0
     low_budget_seconds: float = 180.0
+    majority_threshold: float = 0.5  # fraction of samples required to stop early
+    token_limit: int = 60000
 
 
 @dataclass
@@ -320,6 +328,23 @@ def warmup_model_cache(path: str, exts: Sequence[str] = (".bin", ".pt", ".safete
     return total_bytes
 
 
+def copy_vllm_compile_cache() -> None:
+    """Copy vLLM torch compile cache if it exists (Kaggle path)."""
+    src = Path("/kaggle/input/gpt-oss-120b-cache-compile/torch_compile_cache")
+    dst = Path("/root/.cache/vllm/torch_compile_cache")
+    if not src.exists():
+        logger.info("No vLLM compile cache found at %s", src)
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        logger.info("vLLM compile cache already present at %s", dst)
+        return
+    logger.info("Copying vLLM compile cache from %s to %s ...", src, dst)
+    import shutil
+    shutil.copytree(src, dst)
+    logger.info("vLLM compile cache copied.")
+
+
 def start_vllm_server(cfg: VLLMServerConfig) -> subprocess.Popen | None:
     if not cfg.start_server:
         return None
@@ -348,7 +373,14 @@ def start_vllm_server(cfg: VLLMServerConfig) -> subprocess.Popen | None:
         str(cfg.max_model_len),
         "--stream-interval",
         str(cfg.stream_interval),
+        "--log-level",
+        "warning",
+        "--no-access-log",
     ]
+    if cfg.speculative_config:
+        command.extend(["--speculative_config", cfg.speculative_config])
+    if cfg.kv_cache_dtype:
+        command.extend(["--kv-cache-dtype", cfg.kv_cache_dtype])
 
     log_path = Path(cfg.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -642,12 +674,17 @@ class HarmonyTIRInferencer:
                 prompts.append(user_content)
         return prompts[:num_samples]
 
-    def inference(self, problem: str, deadline: float, time_budget: Optional[float] = None) -> int:
+    def inference(
+        self,
+        problem: str,
+        deadline: float,
+        time_budget: Optional[float] = None,
+    ) -> tuple[int, list[str], list[Optional[int]], list[int], list[str]]:
         self._deadline = deadline
         start_time = time.time()
 
         prompts = self._format_prompts(problem, time_budget)
-        responses = self._inference_parallel(prompts)
+        responses, token_lens, finish_reasons = self._inference_parallel(prompts)
 
         duration = time.time() - start_time
         logger.info("[inference] Took %.2fs", duration)
@@ -657,20 +694,26 @@ class HarmonyTIRInferencer:
             self.budget_seconds = self.gen_cfg.base_budget_seconds + budget_left
             logger.info("[inference] Updated budget: %.2fs", self.budget_seconds)
 
-        return self.parse_responses(responses)
+        prediction, parsed_answers = self.parse_responses(responses)
+        return prediction, responses, parsed_answers, token_lens, finish_reasons
 
-    def _single_generate_tir(self, prompt: str, stop_event: threading.Event) -> str:
+    def _single_generate_tir(self, prompt: str, stop_event: threading.Event) -> tuple[str, int, str]:
         python_tool = None
         try:
             python_tool = PythonTool(local_jupyter_timeout=self.tool_cfg.local_jupyter_timeout)
             messages = self._apply_chat_template(prompt, python_tool)
             final_answer_found = ""
+            token_count = 0
+            finish_reason = ""
 
             for iteration in range(self.gen_cfg.max_iter):
                 if self._deadline and time.time() >= self._deadline:
                     logger.info("Deadline reached")
+                    finish_reason = "deadline"
                     break
                 if final_answer_found or (stop_event and stop_event.is_set()):
+                    if not finish_reason:
+                        finish_reason = "stop_event" if stop_event and stop_event.is_set() else "final_answer"
                     break
 
                 prompt_ids = self.encoding.render_conversation_for_completion(
@@ -705,6 +748,7 @@ class HarmonyTIRInferencer:
                 for chunk in stream:
                     if stop_event and stop_event.is_set():
                         breaking = True
+                        finish_reason = "stop_event"
                         break
 
                     token_chunk = chunk.choices[0].token_ids
@@ -712,19 +756,23 @@ class HarmonyTIRInferencer:
 
                     if token_chunk:
                         token_buffer.extend(token_chunk)
+                        token_count += len(token_chunk)
                         token_buffer_str += text_chunk
 
                     if self._deadline and time.time() >= self._deadline:
+                        finish_reason = "deadline"
                         breaking = True
                         break
 
-                    if len(token_buffer) > 60_000:
-                        logger.warning("Token limit exceeded")
+                    if len(token_buffer) > self.gen_cfg.token_limit:
+                        logger.warning("Token limit exceeded (%d)", self.gen_cfg.token_limit)
+                        finish_reason = "token_limit"
                         breaking = True
                         break
 
                     if "}" in text_chunk and self.extract_boxed_text(token_buffer_str) is not None:
                         final_answer_found = token_buffer_str
+                        finish_reason = "boxed"
                         breaking = True
                         break
 
@@ -742,6 +790,8 @@ class HarmonyTIRInferencer:
 
                     last_message = messages[-1]
                     if last_message.channel == "final" or token_buffer[-1] == 200002:
+                        if not finish_reason:
+                            finish_reason = "stream_end"
                         break
 
                     if last_message.recipient == "python":
@@ -750,31 +800,46 @@ class HarmonyTIRInferencer:
                         messages.extend(response_msgs)
 
             if final_answer_found:
-                return final_answer_found
+                return final_answer_found, token_count, finish_reason or "boxed"
 
-            return self.encoding.decode_utf8(
-                self.encoding.render_conversation_for_training(
-                    Conversation.from_messages(messages),
-                    self.render_cfg,
-                )
+            if not finish_reason:
+                finish_reason = "max_iter" if iteration + 1 >= self.gen_cfg.max_iter else "unknown"
+
+            return (
+                self.encoding.decode_utf8(
+                    self.encoding.render_conversation_for_training(
+                        Conversation.from_messages(messages),
+                        self.render_cfg,
+                    )
+                ),
+                token_count,
+                finish_reason,
             )
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Error in generation: %s", exc)
-            return ""
+            return "", token_count, "error"
         finally:
             if python_tool:
                 python_tool.close()
 
-    def _inference_parallel(self, prompts: list[str]) -> list[str]:
+    def _inference_parallel(self, prompts: list[str]) -> tuple[list[str], list[int], list[str]]:
         stop_event = threading.Event()
         answers_collected: list[int] = []
         raw_responses = [""] * len(prompts)
-        majority_threshold = len(prompts) / 2
+        token_lens = [0] * len(prompts)
+        finish_reasons = [""] * len(prompts)
+        majority_threshold = len(prompts) * self.gen_cfg.majority_threshold
 
-        logger.info("Sampling %d times (threshold: > %.1f)...", len(prompts), majority_threshold)
+        logger.info(
+            "Sampling %d times (threshold: > %.2f, cfg=%.2f)...",
+            len(prompts),
+            majority_threshold,
+            self.gen_cfg.majority_threshold,
+        )
 
         executor = ThreadPoolExecutor(max_workers=max(1, len(prompts)))
+        majority_reached = False
         try:
             future_to_idx = {
                 executor.submit(self._single_generate_tir, p, stop_event): i
@@ -784,8 +849,10 @@ class HarmonyTIRInferencer:
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
                 try:
-                    result_text = future.result()
+                    result_text, tok_len, reason = future.result()
                     raw_responses[idx] = result_text
+                    token_lens[idx] = tok_len
+                    finish_reasons[idx] = reason or ""
 
                     ans = self.extract_boxed_text(result_text)
                     if ans is not None:
@@ -793,16 +860,27 @@ class HarmonyTIRInferencer:
                         counts = Counter(answers_collected)
                         most_common_ans, count = counts.most_common(1)[0]
 
-                        if count > majority_threshold:
-                            logger.info("Majority reached: %s appeared %d times", most_common_ans, count)
+                        if not majority_reached and count > majority_threshold:
+                            logger.info(
+                                "Majority reached: %s appeared %d times",
+                                most_common_ans,
+                                count,
+                            )
+                            majority_reached = True
                             stop_event.set()
                             break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Task exception: %s", exc)
+                if majority_reached:
+                    break
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            if majority_reached:
+                for fut in future_to_idx:
+                    if not fut.done():
+                        fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=False)
 
-        return raw_responses
+        return raw_responses, token_lens, finish_reasons
 
     @staticmethod
     def extract_boxed_text(text: str) -> int | None:
@@ -834,18 +912,18 @@ class HarmonyTIRInferencer:
 
         return None
 
-    def parse_responses(self, responses: list[str]) -> int:
-        answers = [self.extract_boxed_text(r) for r in responses]
+    def parse_responses(self, responses: list[str]) -> tuple[int, list[Optional[int]]]:
+        answers: list[Optional[int]] = [self.extract_boxed_text(r) for r in responses]
         valid_answers = [a for a in answers if a is not None]
         if not valid_answers:
             logger.warning("No valid answers found; returning 0")
-            return 0
+            return 0, answers
 
         counter = Counter(valid_answers)
         logger.info("Answers: %s", counter)
 
         most_common = counter.most_common(1)[0][0]
-        return most_common % 100000
+        return most_common % 100000, answers
 
 
 INFERENCER = HarmonyTIRInferencer(CONFIG)
@@ -910,7 +988,18 @@ def predict(
         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(deadline)),
     )
 
-    prediction = INFERENCER.inference(question_text, deadline=deadline, time_budget=question_budget)
+    (
+        prediction,
+        raw_responses,
+        parsed_answers,
+        token_lens,
+        finish_reasons,
+    ) = INFERENCER.inference(
+        question_text,
+        deadline=deadline,
+        time_budget=question_budget,
+    )
+    # raw_responses: list[str], parsed_answers: list[Optional[int]], token_lens: list[int], finish_reasons: list[str]
     PREDICTION_TRACKER.record(question_id, prediction)
     TIME_MANAGER.consume_iteration()
 
@@ -944,6 +1033,8 @@ def main() -> None:
     # Optional warmup if explicitly requested
     if os.getenv("WARMUP_MODEL_CACHE") == "1":
         warmup_model_cache(CONFIG.vllm.model_path, chunk_mb=1024)
+    if os.getenv("COPY_VLLM_CACHE", "1") == "1":
+        copy_vllm_compile_cache()
 
     vllm_process = start_vllm_server(CONFIG.vllm)
 
