@@ -401,7 +401,8 @@ class GptOssTokenizer(HuggingFaceTokenizer):
         stream = state.stream
         for token_id in all_input_ids[state.ids_offset:]:
             stream.process(token_id)
-            if stream.current_channel in ['final', 'analysis'] and stream.current_role == self.role:
+            # Output all content from assistant role, regardless of channel
+            if stream.current_role == self.role:
                 response += stream.last_content_delta or ''
 
         state.ids_offset = len(all_input_ids)

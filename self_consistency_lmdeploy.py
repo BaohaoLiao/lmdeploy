@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Self-consistency TIR inference script.
+Self-consistency TIR inference script using LMDeploy.
 
-Refactored from self-consistency-strategy.ipynb to mirror the structure and
-organization of aimo.py.
+Refactored from self_consistency_strategy.py to use LMDeploy pipeline (offline engine)
+instead of vLLM server-client architecture.
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import polars as pl
-from openai import OpenAI
-from transformers import AutoTokenizer, set_seed
+import torch
+from transformers import set_seed
 
 from openai_harmony import (
     HarmonyEncodingName,
@@ -53,6 +53,8 @@ from openai_harmony import (
     TextContent,
 )
 
+from lmdeploy import pipeline as lm_pipeline, TurbomindEngineConfig, GenerationConfig as LMDeployGenerationConfig
+
 import kaggle_evaluation.aimo_3_inference_server as aimo_server
 
 
@@ -65,8 +67,7 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-# Quiet noisy HTTP client logs (OpenAI/httpx/httpcore)
-logging.getLogger("openai").setLevel(logging.WARNING)
+# Quiet noisy logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -93,27 +94,22 @@ for _k, _v in ENV_VARS.items():
 # ============================================================
 
 @dataclass
-class VLLMServerConfig:
+class LMDeployConfig:
     model_path: str
-    served_model_name: str = "gpt-oss"
-    host: str = "0.0.0.0"
-    port: int = 8000
-    tensor_parallel_size: int = 1
-    max_num_seqs: int = 64
-    gpu_memory_utilization: float = 0.96
+    gpu_indices: Optional[List[int]] = None
+    max_batch_size: int = 64
+    enable_prefix_caching: bool = True
+    cache_max_entry_count: float = 0.96
+    max_prefill_token_num: int = 4096
+    session_len: int = 64 * 1024 + 4096 + 128
     dtype: str = "auto"
-    max_model_len: int = 64 * 1024
-    stream_interval: int = 20
-    start_server: bool = True
-    log_path: str = "vllm.log"
-    speculative_config: Optional[str] = None
-    kv_cache_dtype: Optional[str] = None
 
 
 @dataclass
 class GenerationConfig:
     temperature: float = 1.0
     top_p: float = 1.0
+    top_k: int = 50
     min_p: float = 0.02
     seed: int = 42
     sample_count: int = 8
@@ -130,6 +126,9 @@ class GenerationConfig:
     token_limit: int = 60000
     context_early_window: int = 2
     context_recent_window: int = 2
+    max_new_tokens: int = 32000
+    skip_special_tokens: bool = False  # Must be False to preserve Harmony protocol tokens
+    do_sample: bool = True
 
 
 @dataclass
@@ -160,7 +159,7 @@ class PromptTemplate:
 
 @dataclass
 class AppConfig:
-    vllm: VLLMServerConfig
+    lmdeploy: LMDeployConfig
     generation: GenerationConfig
     tool: ToolConfig
     timing: TimingConfig
@@ -173,8 +172,9 @@ class AppConfig:
 # ============================================================
 
 CONFIG = AppConfig(
-    vllm=VLLMServerConfig(
+    lmdeploy=LMDeployConfig(
         model_path="/kaggle/input/gpt-oss-120b/transformers/default/1",
+        gpu_indices=[0],
     ),
     generation=GenerationConfig(),
     tool=ToolConfig(),
@@ -283,6 +283,9 @@ def set_random_seeds(seed: Optional[int]) -> None:
         return
     os.environ["PYTHONHASHSEED"] = str(seed)
     set_seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def warmup_model_cache(path: str, exts: Sequence[str] = (".bin", ".pt", ".safetensors"), num_workers: Optional[int] = None, chunk_mb: int = 256) -> int:
@@ -335,74 +338,6 @@ def warmup_model_cache(path: str, exts: Sequence[str] = (".bin", ".pt", ".safete
     gb = total_bytes / 1024**3
     logger.info("[cache_model] total read ≈ %.2f GB in %.2fs", gb, elapsed)
     return total_bytes
-
-
-def copy_vllm_compile_cache() -> None:
-    """Copy vLLM torch compile cache if it exists (Kaggle path)."""
-    src = Path("/kaggle/input/gpt-oss-120b-cache-compile/torch_compile_cache")
-    dst = Path("/root/.cache/vllm/torch_compile_cache")
-    if not src.exists():
-        logger.info("No vLLM compile cache found at %s", src)
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        logger.info("vLLM compile cache already present at %s", dst)
-        return
-    logger.info("Copying vLLM compile cache from %s to %s ...", src, dst)
-    import shutil
-    shutil.copytree(src, dst)
-    logger.info("vLLM compile cache copied.")
-
-
-def start_vllm_server(cfg: VLLMServerConfig) -> subprocess.Popen | None:
-    if not cfg.start_server:
-        return None
-
-    command = [
-        "python",
-        "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
-        cfg.model_path,
-        "--served-model-name",
-        cfg.served_model_name,
-        "--tensor-parallel-size",
-        str(cfg.tensor_parallel_size),
-        "--max-num-seqs",
-        str(cfg.max_num_seqs),
-        "--gpu-memory-utilization",
-        str(cfg.gpu_memory_utilization),
-        "--host",
-        cfg.host,
-        "--port",
-        str(cfg.port),
-        "--dtype",
-        cfg.dtype,
-        "--max-model-len",
-        str(cfg.max_model_len),
-        "--stream-interval",
-        str(cfg.stream_interval),
-        "--log-level",
-        "warning",
-        "--no-access-log",
-    ]
-    if cfg.speculative_config:
-        command.extend(["--speculative_config", cfg.speculative_config])
-    if cfg.kv_cache_dtype:
-        command.extend(["--kv-cache-dtype", cfg.kv_cache_dtype])
-
-    log_path = Path(cfg.log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logfile = log_path.open("w")
-    logger.info("Starting vLLM server... (logs: %s)", log_path)
-    process = subprocess.Popen(
-        command,
-        stdout=logfile,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    process._log_handle = logfile  # type: ignore[attr-defined]
-    return process
 
 
 # ============================================================
@@ -596,43 +531,70 @@ class PythonTool:
 
 
 # ============================================================
+# LMDeploy Pipeline Initialization
+# ============================================================
+
+_PIPELINE = None  # type: ignore[assignment]
+
+
+def get_pipeline():
+    """Lazily initialize and return the LMDeploy pipeline."""
+    global _PIPELINE
+    if _PIPELINE is not None:
+        return _PIPELINE
+
+    lmdeploy_cfg = CONFIG.lmdeploy
+
+    # GPU selection
+    if lmdeploy_cfg.gpu_indices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, lmdeploy_cfg.gpu_indices))
+        num_gpus = len(lmdeploy_cfg.gpu_indices)
+    else:
+        num_gpus = torch.cuda.device_count()
+
+    backend_cfg = TurbomindEngineConfig(
+        tp=num_gpus,
+        session_len=lmdeploy_cfg.session_len,
+        max_batch_size=lmdeploy_cfg.max_batch_size,
+        enable_prefix_caching=lmdeploy_cfg.enable_prefix_caching,
+        cache_max_entry_count=lmdeploy_cfg.cache_max_entry_count,
+        max_prefill_token_num=lmdeploy_cfg.max_prefill_token_num,
+    )
+
+    logger.info("Initializing LMDeploy pipeline...")
+    _PIPELINE = lm_pipeline(lmdeploy_cfg.model_path, backend_cfg)
+    logger.info("LMDeploy pipeline initialized.")
+    return _PIPELINE
+
+
+# ============================================================
 # Harmony TIR Inferencer
 # ============================================================
 
 class HarmonyTIRInferencer:
-    """Inferencer using Harmony protocol with TIR (Tool-Integrated Reasoning)."""
+    """Inferencer using Harmony protocol with TIR (Tool-Integrated Reasoning) and LMDeploy."""
 
     def __init__(self, cfg: AppConfig) -> None:
         self.cfg = cfg
-        self.vllm_cfg = cfg.vllm
+        self.lmdeploy_cfg = cfg.lmdeploy
         self.gen_cfg = cfg.generation
         self.tool_cfg = cfg.tool
         self.prompt_list = cfg.prompt_list
 
         self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.stop_token_ids = self.encoding.stop_tokens_for_assistant_actions()
-        self.tokenizer = AutoTokenizer.from_pretrained(self.vllm_cfg.model_path, trust_remote_code=True)
-
-        self.client = OpenAI(
-            base_url=f"http://{self.vllm_cfg.host}:{self.vllm_cfg.port}/v1",
-            api_key="sk-local",
-            timeout=360,
-        )
 
         self.budget_seconds = self.gen_cfg.initial_budget_seconds
         self.render_cfg = RenderConversationConfig(auto_drop_analysis=False)
 
-    def wait_server(self, timeout_seconds: int = 15 * 60) -> None:
-        """Wait for vLLM server to be ready."""
-        start = time.time()
-        while time.time() - start < timeout_seconds:
-            try:
-                self.client.models.list()
-                logger.info("vLLM server is ready.")
-                return
-            except Exception:
-                time.sleep(1)
-        raise RuntimeError("vLLM server failed to start within timeout.")
+        # LMDeploy generation config
+        self.lmdeploy_gen_cfg = LMDeployGenerationConfig(
+            temperature=self.gen_cfg.temperature,
+            top_p=self.gen_cfg.top_p,
+            top_k=self.gen_cfg.top_k,
+            max_new_tokens=self.gen_cfg.max_new_tokens,
+            skip_special_tokens=self.gen_cfg.skip_special_tokens,
+        )
 
     def _determine_sample_count(self, time_budget: Optional[float] = None) -> int:
         if time_budget is not None:
@@ -725,140 +687,121 @@ class HarmonyTIRInferencer:
         prediction, parsed_answers = self.parse_responses(responses)
         return prediction, responses, parsed_answers, token_lens, finish_reasons
 
-    def _single_generate_tir(self, prompt: str, stop_event: threading.Event) -> tuple[str, int, str]:
-        python_tool = None
+    def _single_sample_worker(
+        self,
+        sample_idx: int,
+        prompt: str,
+        stop_event: threading.Event,
+        result_queue: queue.Queue,
+    ) -> None:
+        """
+        Worker function that handles a single sample generation.
+        Generates with tool config for Harmony protocol format, but doesn't parse/execute tools.
+        """
         try:
+            # Create tool config for proper Harmony protocol format
             python_tool = PythonTool(local_jupyter_timeout=self.tool_cfg.local_jupyter_timeout)
-            messages = self._apply_chat_template(prompt, python_tool)
-            final_answer_found = ""
-            token_count = 0
-            finish_reason = ""
+            tool_config = python_tool.tool_config
 
-            for iteration in range(self.gen_cfg.max_iter):
-                if self._deadline and time.time() >= self._deadline:
-                    logger.info("Deadline reached")
-                    finish_reason = "deadline"
-                    break
-                if final_answer_found or (stop_event and stop_event.is_set()):
-                    if not finish_reason:
-                        finish_reason = "stop_event" if stop_event and stop_event.is_set() else "final_answer"
-                    break
-
-                prompt_ids = self.encoding.render_conversation_for_completion(
-                    Conversation.from_messages(messages),
-                    Role.ASSISTANT,
-                )
-                max_tokens = self.vllm_cfg.max_model_len - len(prompt_ids)
-                if max_tokens < 1:
-                    logger.warning("Context full before generation")
-                    break
-
-                token_buffer: list[int] = []
-                token_buffer_str = ""
-                breaking = False
-
-                stream = self.client.completions.create(
-                    model=self.vllm_cfg.served_model_name,
-                    prompt=prompt_ids,
-                    max_tokens=max_tokens,
-                    temperature=self.gen_cfg.temperature,
-                    top_p=self.gen_cfg.top_p,
-                    seed=self.gen_cfg.seed,
-                    stream=True,
-                    extra_body=dict(
-                        min_p=self.gen_cfg.min_p,
-                        stop_token_ids=self.stop_token_ids,
-                        return_token_ids=True,
-                    ),
-                    timeout=360,
-                )
-
-                for chunk in stream:
-                    if stop_event and stop_event.is_set():
-                        breaking = True
-                        finish_reason = "stop_event"
-                        break
-
-                    token_chunk = chunk.choices[0].token_ids
-                    text_chunk = chunk.choices[0].text
-
-                    if token_chunk:
-                        token_buffer.extend(token_chunk)
-                        token_count += len(token_chunk)
-                        token_buffer_str += text_chunk
-
-                    if self._deadline and time.time() >= self._deadline:
-                        finish_reason = "deadline"
-                        breaking = True
-                        break
-
-                    if len(token_buffer) > self.gen_cfg.token_limit:
-                        logger.warning("Token limit exceeded (%d)", self.gen_cfg.token_limit)
-                        finish_reason = "token_limit"
-                        breaking = True
-                        break
-
-                    if "}" in text_chunk and self.extract_boxed_text(token_buffer_str) is not None:
-                        final_answer_found = token_buffer_str
-                        finish_reason = "boxed"
-                        breaking = True
-                        break
-
-                with contextlib.suppress(Exception):
-                    stream.close()
-
-                if breaking:
-                    break
-
-                if token_buffer:
-                    new_messages = self.encoding.parse_messages_from_completion_tokens(
-                        token_buffer, Role.ASSISTANT
-                    )
-                    messages.extend(new_messages)
-                    messages = self._trim_context(messages)
-
-                    last_message = messages[-1]
-                    if last_message.channel == "final" or token_buffer[-1] == 200002:
-                        if not finish_reason:
-                            finish_reason = "stream_end"
-                        break
-
-                    if last_message.recipient == "python":
-                        logger.info("Executing Python tool...")
-                        response_msgs = python_tool.process_sync_plus(last_message)
-                        messages.extend(response_msgs)
-
-            if final_answer_found:
-                return final_answer_found, token_count, finish_reason or "boxed"
-
-            if not finish_reason:
-                finish_reason = "max_iter" if iteration + 1 >= self.gen_cfg.max_iter else "unknown"
-
-            return (
-                self.encoding.decode_utf8(
-                    self.encoding.render_conversation_for_training(
-                        Conversation.from_messages(messages),
-                        self.render_cfg,
-                    )
+            # Render prompt with tool configuration
+            messages = [
+                Message.from_role_and_content(
+                    Role.SYSTEM,
+                    SystemContent.new()
+                    .with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
+                    .with_tools(tool_config),
                 ),
-                token_count,
-                finish_reason,
+                Message.from_role_and_content(Role.USER, prompt),
+            ]
+
+            prompt_ids = self.encoding.render_conversation_for_completion(
+                Conversation.from_messages(messages),
+                Role.ASSISTANT,
+            )
+            prompt_str = self.encoding.decode_utf8(prompt_ids)
+
+            pipe = get_pipeline()
+
+            max_tokens = self.lmdeploy_cfg.session_len - len(prompt_ids)
+            if max_tokens < 1:
+                logger.warning("Sample %d: Context full", sample_idx)
+                result_queue.put(("complete", sample_idx, "", 0, "context_full", None))
+                return
+
+            gen_cfg = LMDeployGenerationConfig(
+                temperature=self.gen_cfg.temperature,
+                top_p=self.gen_cfg.top_p,
+                top_k=self.gen_cfg.top_k,
+                max_new_tokens=min(max_tokens, self.gen_cfg.max_new_tokens),
+                skip_special_tokens=self.gen_cfg.skip_special_tokens,
+                stop_token_ids=self.stop_token_ids,  # Harmony protocol stop tokens
             )
 
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Error in generation: %s", exc)
-            return "", token_count, "error"
-        finally:
-            if python_tool:
+            token_buffer_str = ""
+            token_count = 0
+            finish_reason = ""
+            final_answer = None
+
+            # Stream generation for this sample
+            for resp in pipe.stream_infer(
+                prompts=[prompt_str],
+                gen_config=gen_cfg,
+                do_preprocess=False,
+            ):
+                if stop_event.is_set():
+                    finish_reason = "stop_event"
+                    break
+
+                if resp.text:
+                    token_buffer_str += resp.text
+                    token_count = resp.generate_token_len
+
+                if self._deadline and time.time() >= self._deadline:
+                    finish_reason = "deadline"
+                    break
+
+                if token_count > self.gen_cfg.token_limit:
+                    logger.warning("Sample %d: Token limit exceeded", sample_idx)
+                    finish_reason = "token_limit"
+                    break
+
+                # Check for boxed answer
+                if "}" in resp.text:
+                    candidate = self.extract_boxed_text(token_buffer_str)
+                    if candidate is not None:
+                        final_answer = candidate
+                        finish_reason = "boxed"
+                        # Notify via queue immediately
+                        result_queue.put(("answer", sample_idx, candidate))
+                        break
+
+            if not finish_reason:
+                finish_reason = "completed"
+
+            # Send final result
+            result_queue.put(("complete", sample_idx, token_buffer_str, token_count, finish_reason, final_answer))
+
+            # Cleanup
+            python_tool.close()
+
+        except Exception as exc:
+            logger.exception("Sample %d: Error in generation: %s", sample_idx, exc)
+            result_queue.put(("complete", sample_idx, "", 0, "error", None))
+            if 'python_tool' in locals():
                 python_tool.close()
 
     def _inference_parallel(self, prompts: list[str]) -> tuple[list[str], list[int], list[str]]:
-        stop_event = threading.Event()
+        """
+        Run parallel inference with independent per-sample TIR loops.
+        Uses ThreadPoolExecutor for true independence, but batching happens
+        naturally when multiple samples hit the GPU at the same time.
+        """
         answers_collected: list[int] = []
         raw_responses = [""] * len(prompts)
         token_lens = [0] * len(prompts)
         finish_reasons = [""] * len(prompts)
         majority_threshold = len(prompts) * self.gen_cfg.majority_threshold
+        majority_reached = False
 
         logger.info(
             "Sampling %d times (threshold: > %.2f, cfg=%.2f)...",
@@ -867,47 +810,66 @@ class HarmonyTIRInferencer:
             self.gen_cfg.majority_threshold,
         )
 
-        executor = ThreadPoolExecutor(max_workers=max(1, len(prompts)))
-        majority_reached = False
+        stop_event = threading.Event()
+        result_queue: queue.Queue = queue.Queue()
+        completed_count = 0
+
+        # Launch all workers
+        executor = ThreadPoolExecutor(max_workers=len(prompts))
+        futures = []
+        for idx, prompt in enumerate(prompts):
+            future = executor.submit(
+                self._single_sample_worker,
+                idx,
+                prompt,
+                stop_event,
+                result_queue,
+            )
+            futures.append(future)
+
         try:
-            future_to_idx = {
-                executor.submit(self._single_generate_tir, p, stop_event): i
-                for i, p in enumerate(prompts)
-            }
-
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+            # Process results as they come in
+            while completed_count < len(prompts) and not majority_reached:
                 try:
-                    result_text, tok_len, reason = future.result()
-                    raw_responses[idx] = result_text
-                    token_lens[idx] = tok_len
-                    finish_reasons[idx] = reason or ""
+                    result = result_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
 
-                    ans = self.extract_boxed_text(result_text)
-                    if ans is not None:
-                        answers_collected.append(ans)
-                        counts = Counter(answers_collected)
-                        most_common_ans, count = counts.most_common(1)[0]
+                if result[0] == "answer":
+                    # Intermediate answer found
+                    _, sample_idx, answer = result
+                    answers_collected.append(answer)
 
-                        if not majority_reached and count > majority_threshold:
-                            logger.info(
-                                "Majority reached: %s appeared %d times",
-                                most_common_ans,
-                                count,
-                            )
-                            majority_reached = True
-                            stop_event.set()
-                            break
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Task exception: %s", exc)
-                if majority_reached:
-                    break
+                    # Check for majority
+                    counts = Counter(answers_collected)
+                    most_common_ans, count = counts.most_common(1)[0]
+                    if count > majority_threshold:
+                        logger.info(
+                            "Majority reached: %s appeared %d times",
+                            most_common_ans,
+                            count,
+                        )
+                        majority_reached = True
+                        stop_event.set()
+                        break
+
+                elif result[0] == "complete":
+                    # Sample completed
+                    _, sample_idx, text, tok_len, reason, final_ans = result
+                    raw_responses[sample_idx] = text
+                    token_lens[sample_idx] = tok_len
+                    finish_reasons[sample_idx] = reason
+
+                    # Add final answer if not already added
+                    if final_ans is not None and final_ans not in answers_collected:
+                        answers_collected.append(final_ans)
+
+                    completed_count += 1
+
         finally:
-            if majority_reached:
-                for fut in future_to_idx:
-                    if not fut.done():
-                        fut.cancel()
-            executor.shutdown(wait=False, cancel_futures=False)
+            # Cleanup
+            stop_event.set()
+            executor.shutdown(wait=True, cancel_futures=False)
 
         return raw_responses, token_lens, finish_reasons
 
@@ -927,7 +889,7 @@ class HarmonyTIRInferencer:
                     except Exception:
                         pass
 
-        pattern = r"(?i)final\\s+answer\\s*(?:is|:)?\\s*(\\d+)"
+        pattern = r"(?i)final\s+answer\s*(?:is|:)?\s*(\d+)"
         matches = re.findall(pattern, text)
         if matches:
             for match in reversed(matches):
@@ -1061,53 +1023,41 @@ def main() -> None:
 
     # Optional warmup if explicitly requested
     if os.getenv("WARMUP_MODEL_CACHE") == "1":
-        warmup_model_cache(CONFIG.vllm.model_path, chunk_mb=1024)
-    if os.getenv("COPY_VLLM_CACHE", "1") == "1":
-        copy_vllm_compile_cache()
+        warmup_model_cache(CONFIG.lmdeploy.model_path, chunk_mb=1024)
 
-    vllm_process = start_vllm_server(CONFIG.vllm)
+    # Initialize pipeline
+    logger.info("Initializing LMDeploy pipeline...")
+    _ = get_pipeline()
 
-    try:
-        INFERENCER.wait_server()
-        setup_seconds = time.time() - program_start
-        TIME_MANAGER.reset_after_setup(setup_seconds)
-        logger.info(
-            "Setup time: %.2fs, usable generation time: %.2fs",
-            setup_seconds,
-            TIME_MANAGER.usable_seconds,
-        )
-        PREDICTION_TRACKER.ground_truth = prepare_reference_dataset(CONFIG.dataset)
+    setup_seconds = time.time() - program_start
+    TIME_MANAGER.reset_after_setup(setup_seconds)
+    logger.info(
+        "Setup time: %.2fs, usable generation time: %.2fs",
+        setup_seconds,
+        TIME_MANAGER.usable_seconds,
+    )
+    PREDICTION_TRACKER.ground_truth = prepare_reference_dataset(CONFIG.dataset)
 
-        inference_server = aimo_server.AIMO3InferenceServer(predict)
+    inference_server = aimo_server.AIMO3InferenceServer(predict)
 
-        if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
-            logger.info("Starting inference server in competition rerun mode...")
-            inference_server.serve()
-            return
+    if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
+        logger.info("Starting inference server in competition rerun mode...")
+        inference_server.serve()
+        return
 
-        logger.info("Running local gateway for evaluation...")
-        inference_server.run_local_gateway((CONFIG.dataset.submission_csv,))
+    logger.info("Running local gateway for evaluation...")
+    inference_server.run_local_gateway((CONFIG.dataset.submission_csv,))
 
-        if PREDICTION_TRACKER.ground_truth and PREDICTION_TRACKER.total > 0:
-            logger.info("=" * 50)
-            logger.info("FINAL ACCURACY: %d/%d (%.1f%%)", PREDICTION_TRACKER.correct, PREDICTION_TRACKER.total, PREDICTION_TRACKER.accuracy())
-            logger.info("=" * 50)
-            for qid, pred in PREDICTION_TRACKER.predictions.items():
-                gt = PREDICTION_TRACKER.ground_truth.get(qid)
-                if gt is None:
-                    continue
-                status = "✅" if pred == gt else "❌"
-                logger.info("  %s: pred=%s, gt=%s %s", qid, pred, gt, status)
-
-    finally:
-        if vllm_process is not None:
-            with contextlib.suppress(Exception):
-                vllm_process.terminate()
-            with contextlib.suppress(Exception):
-                log_handle = getattr(vllm_process, "_log_handle", None)
-                if log_handle is not None:
-                    log_handle.close()
-            logger.info("Stopped vLLM server.")
+    if PREDICTION_TRACKER.ground_truth and PREDICTION_TRACKER.total > 0:
+        logger.info("=" * 50)
+        logger.info("FINAL ACCURACY: %d/%d (%.1f%%)", PREDICTION_TRACKER.correct, PREDICTION_TRACKER.total, PREDICTION_TRACKER.accuracy())
+        logger.info("=" * 50)
+        for qid, pred in PREDICTION_TRACKER.predictions.items():
+            gt = PREDICTION_TRACKER.ground_truth.get(qid)
+            if gt is None:
+                continue
+            status = "✅" if pred == gt else "❌"
+            logger.info("  %s: pred=%s, gt=%s %s", qid, pred, gt, status)
 
 
 if __name__ == "__main__":
