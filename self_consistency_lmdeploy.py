@@ -556,7 +556,8 @@ class HarmonyTIRInferencer:
                     if self._deadline and time.time() >= self._deadline:
                         finish_reason = "deadline"
                         breaking = True
-                        self._stop_all_sessions(pipe)
+                        # Stop current session immediately, don't wait for _stop_all_sessions
+                        # which will be called by the coordinator thread
                         break
 
                     if len(token_buffer) > self.gen_cfg.token_limit:
@@ -575,9 +576,11 @@ class HarmonyTIRInferencer:
                 # Add tokens from this iteration to total count
                 token_count += iteration_token_count
 
-                self._stop_session(pipe, session_id)
-
+                # Only stop session if breaking early (not natural stream end)
+                # Natural stream end is handled by LMDeploy automatically
                 if breaking:
+                    if finish_reason in {"stop_event", "deadline", "token_limit"}:
+                        self._stop_session(pipe, session_id, timeout=0.5)
                     break
 
                 # Check stop_event before processing messages
@@ -728,26 +731,55 @@ class HarmonyTIRInferencer:
         return raw_responses, token_lens, finish_reasons
 
     @staticmethod
-    def _stop_session(pipe, session_id: int) -> None:
+    def _stop_session(pipe, session_id: int, timeout: float = 1.0) -> bool:
         """
         Stop a specific session via the lmdeploy pipeline.
+
+        Args:
+            pipe: The LMDeploy pipeline
+            session_id: The session ID to stop
+            timeout: Maximum time to wait for stop operation (seconds)
+
+        Returns:
+            True if session was stopped successfully, False otherwise
         """
         if hasattr(pipe, "_run") and hasattr(pipe, "stop_session"):
             try:
                 fut = pipe._run(coro=pipe.stop_session(session_id))
-                fut.result()
+                fut.result(timeout=timeout)
+                return True
+            except TimeoutError:
+                logger.warning("Timeout stopping session %s after %.1fs", session_id, timeout)
+                return False
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to stop session %s early: %s", session_id, exc)
+                logger.warning("Failed to stop session %s: %s", session_id, exc)
+                return False
+        return False
 
     @staticmethod
-    def _stop_all_sessions(pipe) -> None:
-        """Stop all active sessions on the pipeline when we need to cut early."""
+    def _stop_all_sessions(pipe, timeout: float = 2.0) -> bool:
+        """
+        Stop all active sessions on the pipeline when we need to cut early.
+
+        Args:
+            pipe: The LMDeploy pipeline
+            timeout: Maximum time to wait for stop operation (seconds)
+
+        Returns:
+            True if all sessions were stopped successfully, False otherwise
+        """
         if hasattr(pipe, "_run") and hasattr(pipe, "stop_all_session"):
             try:
                 fut = pipe._run(coro=pipe.stop_all_session())
-                fut.result()
+                fut.result(timeout=timeout)
+                return True
+            except TimeoutError:
+                logger.warning("Timeout stopping all sessions after %.1fs", timeout)
+                return False
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to stop sessions early: %s", exc)
+                logger.warning("Failed to stop all sessions: %s", exc)
+                return False
+        return False
 
     @staticmethod
     def extract_boxed_text(text: str) -> int | None:
