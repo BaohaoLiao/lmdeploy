@@ -392,10 +392,6 @@ class HarmonyTIRInferencer:
             skip_special_tokens=self.gen_cfg.skip_special_tokens,
         )
 
-        # Pre-compile regex patterns for faster extraction (2-5x speedup)
-        self._boxed_pattern = re.compile(r"oxed{(.*?)}")
-        self._final_answer_pattern = re.compile(r"(?i)final\s+answer\s*(?:is|:)?\s*(\d+)")
-
     def _determine_sample_count(self, time_budget: Optional[float] = None) -> int:
         if time_budget is not None:
             if time_budget >= self.gen_cfg.high_budget_seconds:
@@ -484,8 +480,7 @@ class HarmonyTIRInferencer:
         sample_idx: int,
         prompt: str,
         stop_event: threading.Event,
-        result_queue: queue.Queue,
-    ) -> None:
+    )  -> tuple[str, int, str]:
         """
         Worker function that handles a single sample through multiple TIR iterations.
         Each sample can independently execute Python tools and continue generation.
@@ -494,7 +489,6 @@ class HarmonyTIRInferencer:
         try:
             python_tool = PythonTool(local_jupyter_timeout=self.tool_cfg.local_jupyter_timeout)
             messages = self._apply_chat_template(prompt, python_tool)
-            final_answer = None
             token_count = 0
             finish_reason = ""
             final_answer_found = ""
@@ -519,7 +513,7 @@ class HarmonyTIRInferencer:
                 )
                 prompt_str = self.encoding.decode_utf8(prompt_ids)
 
-                max_tokens = self.lmdeploy_cfg.session_len - len(prompt_ids)
+                max_tokens = self.lmdeploy_cfg.session_len - len(prompt_ids) - 1
                 if max_tokens < 1:
                     logger.warning("Sample %d: Context full", sample_idx)
                     break
@@ -541,7 +535,7 @@ class HarmonyTIRInferencer:
                 # Use a fresh session id per iteration so cancellation targets the current stream only.
                 session_id = int(time.time() * 1e6) + sample_idx * 1000 + iteration
 
-                # Stream generation for this sample; close generator early when stopping
+                # Stream generation for this sample
                 stream = pipe.stream_infer(
                     prompts=[prompt_str],
                     gen_config=gen_cfg,
@@ -549,7 +543,7 @@ class HarmonyTIRInferencer:
                     session_id=session_id,
                 )
                 for resp in stream:
-                    if stop_event.is_set():
+                    if stop_event and stop_event.is_set():
                         breaking = True
                         finish_reason = "stop_event"
                         break
@@ -557,44 +551,38 @@ class HarmonyTIRInferencer:
                     if resp.token_ids:
                         token_buffer.extend(resp.token_ids)
                         token_buffer_str += resp.text
-                        # resp.generate_token_len is cumulative, so just use it directly
                         iteration_token_count = resp.generate_token_len
 
                     if self._deadline and time.time() >= self._deadline:
                         finish_reason = "deadline"
                         breaking = True
+                        self._stop_all_sessions(pipe)
                         break
 
-                    # Check for boxed answer (optimized: only check recent text)
-                    if "}" in resp.text:
-                        # For long buffers, check only last 500 chars for faster regex
-                        check_text = token_buffer_str[-500:] if len(token_buffer_str) > 500 else token_buffer_str
-                        if self.extract_boxed_text(check_text) is not None:
-                            finish_reason = "boxed"
-                            final_answer_found += token_buffer_str
-                            breaking = True
-                            break
+                    if len(token_buffer) > self.gen_cfg.token_limit:
+                        logger.warning("Sample %d: Token limit exceeded", sample_idx)
+                        finish_reason = "token_limit"
+                        breaking = True
+                        break
 
-                # If we broke early, cancel the backend session to stop generation.
-                if breaking and finish_reason in {"stop_event", "deadline", "boxed", "token_limit"}:
-                    with contextlib.suppress(Exception):
-                        future = asyncio.run_coroutine_threadsafe(
-                            pipe.stop_session(session_id),
-                            pipe.internal_thread.loop,
-                        )
-                        future.result(timeout=1.0)
+                    # Check for boxed answer
+                    if "}" in resp.text and self.extract_boxed_text(token_buffer_str) is not None:
+                        finish_reason = "boxed"
+                        final_answer_found = token_buffer_str
+                        breaking = True
+                        break
 
-                # Add tokens from this iteration to total count (even if breaking)
+                # Add tokens from this iteration to total count
                 token_count += iteration_token_count
+
+                self._stop_session(pipe, session_id)
 
                 if breaking:
                     break
 
-                # Check if we've exceeded the total token budget across all iterations
-                if token_count > self.gen_cfg.token_limit:
-                    logger.warning("Sample %d: Token limit exceeded (%d > %d)",
-                                   sample_idx, token_count, self.gen_cfg.token_limit)
-                    finish_reason = "token_limit"
+                # Check stop_event before processing messages
+                if stop_event and stop_event.is_set():
+                    finish_reason = "stop_event"
                     break
 
                 if token_buffer:
@@ -614,6 +602,11 @@ class HarmonyTIRInferencer:
 
                     # Execute Python tool if requested (independent of other samples)
                     if last_message.recipient == "python":
+                        # Check stop_event before executing potentially long-running tool
+                        if stop_event and stop_event.is_set():
+                            finish_reason = "stop_event"
+                            break
+
                         tool_call_count += 1
                         logger.info("Sample %d: Executing Python tool (call #%d)...", sample_idx, tool_call_count)
                         response_msgs = python_tool.process_sync_plus(last_message)
@@ -622,7 +615,7 @@ class HarmonyTIRInferencer:
 
 
             if final_answer_found:
-                result_queue.put(("answer", sample_idx, final_answer_found, token_count, finish_reason or "boxed"))
+                return final_answer_found, token_count, finish_reason or "boxed"
 
             if not finish_reason:
                 finish_reason = "max_iter" if iteration + 1 >= self.gen_cfg.max_iter else "unknown"
@@ -631,18 +624,20 @@ class HarmonyTIRInferencer:
             logger.info("Sample %d completed: %d tool calls, %d tokens, reason=%s",
                        sample_idx, tool_call_count, token_count, finish_reason)
 
-            all_text = self.encoding.decode_utf8(
-                self.encoding.render_conversation_for_training(
-                    Conversation.from_messages(messages),
-                    self.render_cfg,
-                )
+            return (
+                self.encoding.decode_utf8(
+                    self.encoding.render_conversation_for_training(
+                        Conversation.from_messages(messages),
+                        self.render_cfg,
+                    )
+                ),
+                token_count,
+                finish_reason,
             )
-            result_queue.put(("complete", sample_idx, all_text, token_count, finish_reason))
 
         except Exception as exc:
             logger.exception("Sample %d: Error in generation: %s", sample_idx, exc)
-            error_msg = f"Error: {type(exc).__name__}: {str(exc)}"
-            result_queue.put(("error", sample_idx, error_msg, 0, "error"))
+            return "", token_count, "error"
         finally:
             if python_tool:
                 python_tool.close()
@@ -653,15 +648,13 @@ class HarmonyTIRInferencer:
         Uses ThreadPoolExecutor for true independence, but batching happens
         naturally when multiple samples hit the GPU at the same time.
         """
-        answer_counts = Counter()  # Incremental counter for efficiency
+        pipe = get_pipeline()
+        stop_event = threading.Event()
+        answer_counts = Counter()
         raw_responses = [""] * len(prompts)
         token_lens = [0] * len(prompts)
         finish_reasons = [""] * len(prompts)
-        has_answer_text = [False] * len(prompts)  # Track if we already captured boxed text
-        counted_samples = [False] * len(prompts)  # Avoid double-counting answers per sample
-        majority_threshold = self.gen_cfg.majority_threshold
-        majority_reached = False
-        majority_reached_at_count = 0  # Track when majority was reached
+        majority_threshold = len(prompts) * self.gen_cfg.majority_threshold
 
         logger.info(
             "Sampling %d times (threshold: >= %d)...",
@@ -669,122 +662,98 @@ class HarmonyTIRInferencer:
             majority_threshold,
         )
 
-        stop_event = threading.Event()
-        result_queue: queue.Queue = queue.Queue()
-        completed_count = 0
-        answer_lock = threading.Lock()  # Thread-safe answer collection
-        futures: list = []
-
-        # Launch all workers
-        executor = ThreadPoolExecutor(max_workers=len(prompts))
-        for idx, prompt in enumerate(prompts):
-            future = executor.submit(
-                self._single_sample_worker,
-                idx,
-                prompt,
-                stop_event,
-                result_queue,
-            )
-            futures.append(future)
-
+        executor = ThreadPoolExecutor(max_workers=max(1, len(prompts)))
+        majority_reached = False
         try:
-            # Process results as they come in
-            while completed_count < len(prompts):
+            future_to_idx = {
+                executor.submit(self._single_sample_worker, i, p, stop_event): i
+                for i, p in enumerate(prompts)
+            }
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 try:
-                    # Use shorter timeout after majority reached to quickly drain queue
-                    timeout = 0.5 if majority_reached else 1.0
-                    result = result_queue.get(timeout=timeout)
-                except queue.Empty:
-                    if majority_reached:
-                        # If majority reached and queue is empty, we're done
-                        break
-                    continue
+                    result_text, tok_len, reason = future.result()
+                    raw_responses[idx] = result_text
+                    token_lens[idx] = tok_len
+                    finish_reasons[idx] = reason or ""
 
-                if result[0] in ("answer", "complete", "error"):
-                    # Process result (answer, complete, or error)
-                    _, sample_idx, text, tok_len, reason = result
-                    if result[0] == "answer":
-                        # Preserve the raw answer text so later "complete" events don't overwrite it
-                        raw_responses[sample_idx] = text
-                        token_lens[sample_idx] = tok_len
-                        finish_reasons[sample_idx] = reason
-                        has_answer_text[sample_idx] = True
-                    elif result[0] == "complete":
-                        # Only overwrite if we haven't already stored an answer
-                        if not has_answer_text[sample_idx] or not raw_responses[sample_idx]:
-                            raw_responses[sample_idx] = text
-                            token_lens[sample_idx] = tok_len
-                            finish_reasons[sample_idx] = reason
-                    else:  # error
-                        raw_responses[sample_idx] = text
-                        token_lens[sample_idx] = tok_len
-                        finish_reasons[sample_idx] = reason
+                    ans = self.extract_boxed_text(result_text)
+                    if ans is not None:
+                        answer_counts[ans] += 1
+                        count = answer_counts[ans]
 
-                    # Only check for majority if not an error
-                    if result[0] != "error":
-                        ans = self.extract_boxed_text(text)
-                        if ans is not None and not counted_samples[sample_idx]:
-                            # Thread-safe incremental counting
-                            with answer_lock:
-                                answer_counts[ans] += 1
-                                count = answer_counts[ans]
-                                logger.info(
-                                    "Sample %d: Extracted answer=%s, count now=%d (result_type=%s)",
-                                    sample_idx, ans, count, result[0]
-                                )
-                                has_answer_text[sample_idx] = True
-                                counted_samples[sample_idx] = True
-                                if count >= majority_threshold and not majority_reached:
-                                    majority_reached_at_count = completed_count + 1  # Will be incremented below
-                                    logger.info(
-                                        "Majority reached: %s appeared %d times (sample_idx=%d, completed_so_far=%d)",
-                                        ans,
-                                        count,
-                                        sample_idx,
-                                        majority_reached_at_count,
-                                    )
-                                    logger.info("Current answer_counts at majority: %s", dict(answer_counts))
-                                    majority_reached = True
-                                    stop_event.set()
-                                    # Break early; remaining workers receive stop_event and will be canceled below.
-                                    break
-
-                    completed_count += 1
-
+                        if not majority_reached and count >= majority_threshold:
+                            logger.info(
+                                "Majority reached: %s appeared %d times",
+                                ans,
+                                count,
+                            )
+                            # Set stop_event first so workers can check it immediately
+                            majority_reached = True
+                            stop_event.set()
+                            # Then stop all GPU sessions
+                            self._stop_all_sessions(pipe)
+                            break
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Task exception: %s", exc)
                 if majority_reached:
                     break
-
         finally:
-            # Cleanup
-            stop_event.set()
+            # Attempt to cancel futures that haven't started yet
             if majority_reached:
-                for fut in futures:
+                for fut in future_to_idx:
                     if not fut.done():
                         fut.cancel()
-                executor.shutdown(wait=False, cancel_futures=False)
-            else:
-                executor.shutdown(wait=True, cancel_futures=False)
 
+            # Wait for all threads to finish gracefully with timeout
+            # This ensures resources are properly cleaned up
+            executor.shutdown(wait=True, cancel_futures=True)
+
+            # Collect results from any remaining futures that completed after early stopping
+            # This ensures we don't lose data from workers that finished while we were breaking
             if majority_reached:
-                extra_collected = completed_count - majority_reached_at_count
-                logger.info(
-                    "After majority: collected %d additional results (total: %d/%d)",
-                    extra_collected,
-                    completed_count,
-                    len(prompts)
-                )
-            elif completed_count < len(prompts):
-                logger.info("Stopped early: collected %d/%d samples", completed_count, len(prompts))
+                for future, idx in future_to_idx.items():
+                    if future.done() and not future.cancelled():
+                        # Only collect if we haven't already collected this result
+                        if raw_responses[idx] == "":
+                            try:
+                                result_text, tok_len, reason = future.result(timeout=0)
+                                raw_responses[idx] = result_text
+                                token_lens[idx] = tok_len
+                                finish_reasons[idx] = reason or ""
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("Failed to collect result for sample %d: %s", idx, exc)
 
         return raw_responses, token_lens, finish_reasons
 
-    def extract_boxed_text(self, text: str) -> int | None:
-        """Extract answer from \\boxed{} or 'final answer is' patterns.
-
-        Uses pre-compiled regex patterns for 2-5x faster extraction.
+    @staticmethod
+    def _stop_session(pipe, session_id: int) -> None:
         """
-        # Use pre-compiled pattern (faster)
-        matches = self._boxed_pattern.findall(str(text))
+        Stop a specific session via the lmdeploy pipeline.
+        """
+        if hasattr(pipe, "_run") and hasattr(pipe, "stop_session"):
+            try:
+                fut = pipe._run(coro=pipe.stop_session(session_id))
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to stop session %s early: %s", session_id, exc)
+
+    @staticmethod
+    def _stop_all_sessions(pipe) -> None:
+        """Stop all active sessions on the pipeline when we need to cut early."""
+        if hasattr(pipe, "_run") and hasattr(pipe, "stop_all_session"):
+            try:
+                fut = pipe._run(coro=pipe.stop_all_session())
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to stop sessions early: %s", exc)
+
+    @staticmethod
+    def extract_boxed_text(text: str) -> int | None:
+        """Extract answer from \\boxed{} or 'final answer is' patterns."""
+        pattern = r"oxed{(.*?)}"
+        matches = re.findall(pattern, str(text))
         if matches:
             for match in reversed(matches):
                 if match:
@@ -796,8 +765,8 @@ class HarmonyTIRInferencer:
                     except Exception:
                         pass
 
-        # Use pre-compiled pattern (faster)
-        matches = self._final_answer_pattern.findall(text)
+        pattern = r"(?i)final\s+answer\s*(?:is|:)?\s*(\d+)"
+        matches = re.findall(pattern, text)
         if matches:
             for match in reversed(matches):
                 if match:
@@ -814,11 +783,11 @@ class HarmonyTIRInferencer:
         answers: list[Optional[int]] = [self.extract_boxed_text(r) for r in responses]
         valid_answers = [a for a in answers if a is not None]
         if not valid_answers:
-            logger.warning("No valid answers found; returning 0")
-            return 0, answers
+            logger.warning("No valid answers found; returning 3407")
+            return 3407, answers
 
         counter = Counter(valid_answers)
-        logger.info("Final parsed answers: %s", counter)
+        logger.info("Answers: %s", counter)
 
         most_common = counter.most_common(1)[0][0]
         return most_common % 100000, answers
