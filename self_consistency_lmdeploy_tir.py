@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Self-consistency TIR inference script using LMDeploy.
+Self-consistency TIR inference script using LMDeploy with proper TIR iterations.
 
-Refactored from self_consistency_strategy.py to use LMDeploy pipeline (offline engine)
-instead of vLLM server-client architecture.
+This version includes actual tool execution in independent worker threads.
 """
 
 from __future__ import annotations
@@ -47,17 +46,30 @@ from openai_harmony import (
     Message,
     Role,
     SystemContent,
+    DeveloperContent,
     ReasoningEffort,
     RenderConversationConfig,
-    ToolNamespaceConfig,
-    Author,
-    TextContent,
 )
 
-from lmdeploy import pipeline as lm_pipeline, TurbomindEngineConfig, GenerationConfig as LMDeployGenerationConfig
+# ============================================================
+# LMDeploy Imports
+# ============================================================
 
-import kaggle_evaluation.aimo_3_inference_server as aimo_server
+from lmdeploy import pipeline as lm_pipeline
+from lmdeploy import GenerationConfig as LMDeployGenerationConfig
+from lmdeploy import TurbomindEngineConfig
 
+# ============================================================
+# Local Imports
+# ============================================================
+
+import aimo_server
+from aimo import (
+    AppConfig,
+    PromptTemplate,
+    load_config,
+    PythonTool,
+)
 
 # ============================================================
 # Logging Configuration
@@ -65,37 +77,24 @@ import kaggle_evaluation.aimo_3_inference_server as aimo_server
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-# Quiet noisy logs
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
 
 # ============================================================
-# Environment Setup
+# Configuration
 # ============================================================
 
-ENV_VARS = {
-    "TRANSFORMERS_NO_TF": "1",
-    "TRANSFORMERS_NO_FLAX": "1",
-    "TRITON_PTXAS_PATH": "/usr/local/cuda/bin/ptxas",
-    "CUDA_VISIBLE_DEVICES": "0",
-    "TOKENIZERS_PARALLELISM": "false",
-    "TIKTOKEN_ENCODINGS_BASE": "/kaggle/usr/lib/pip_install_aimo3_1/tiktoken_encodings",
-}
-
-for _k, _v in ENV_VARS.items():
-    os.environ.setdefault(_k, _v)
-
+CONFIG = load_config()
 
 # ============================================================
-# Configuration Dataclasses
+# LMDeploy Configuration
 # ============================================================
 
 @dataclass
 class LMDeployConfig:
+    """Configuration for LMDeploy pipeline."""
     model_path: str
     gpu_indices: Optional[List[int]] = None
     max_batch_size: int = 64
@@ -108,18 +107,17 @@ class LMDeployConfig:
 
 @dataclass
 class GenerationConfig:
-    temperature: float = 1.0
-    top_p: float = 1.0
-    top_k: int = 50
-    min_p: float = 0.02
-    seed: int = 42
+    """Generation parameters for self-consistency sampling."""
     sample_count: int = 8
+    temperature: float = 0.7
+    top_p: float = 0.95
+    top_k: int = 50
+    seed: int = 42
     use_budget: bool = False
-    max_iter: int = 100
-    base_budget_seconds: float = 60 * 5.5
-    initial_budget_seconds: float = 370.0
-    high_budget_samples: int = 8
+    initial_budget_seconds: float = 600.0
+    base_budget_seconds: float = 300.0
     mid_budget_samples: int = 6
+    high_budget_samples: int = 8
     low_budget_samples: int = 4
     high_budget_seconds: float = 300.0
     low_budget_seconds: float = 180.0
@@ -130,6 +128,7 @@ class GenerationConfig:
     max_new_tokens: int = 32000
     skip_special_tokens: bool = False  # Must be False to preserve Harmony protocol tokens
     do_sample: bool = True
+    max_iter: int = 20  # Maximum TIR iterations per sample
 
 
 @dataclass
@@ -137,421 +136,29 @@ class ToolConfig:
     local_jupyter_timeout: float = 60.0
 
 
-@dataclass
-class TimingConfig:
-    total_hours: float = 4 + 55 / 60
-    checkpoints: int = 50
-    early_minutes: float = 12.0
-    base_budget_seconds: float = 180.0
-
-
-@dataclass
-class DatasetConfig:
-    reference_csv: str = "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv"
-    submission_csv: str = "reference.csv"
-
-
-@dataclass
-class PromptTemplate:
-    system: str
-    user_suffix: str
-    number: int
-
-
-@dataclass
-class AppConfig:
-    lmdeploy: LMDeployConfig
-    generation: GenerationConfig
-    tool: ToolConfig
-    timing: TimingConfig
-    dataset: DatasetConfig
-    prompt_list: List[PromptTemplate]
-
-
 # ============================================================
-# Concrete Configuration Instance
+# Pipeline Management
 # ============================================================
 
-CONFIG = AppConfig(
-    lmdeploy=LMDeployConfig(
-        model_path="/kaggle/input/gpt-oss-120b/transformers/default/1",
-        gpu_indices=[0],
-    ),
-    generation=GenerationConfig(),
-    tool=ToolConfig(),
-    timing=TimingConfig(),
-    dataset=DatasetConfig(),
-    prompt_list=[
-        PromptTemplate(
-            system="",
-            user_suffix="\nPlease reason step by step, and put the final answer (only integer) within \\boxed{}.",
-            number=16,
-        )
-    ],
-)
-
-
-# ============================================================
-# Time Management (Cutoffs)
-# ============================================================
-
-class TimeManager:
-    """Dynamic time budgeting with setup time accounted for."""
-
-    def __init__(self, total_hours: float, early_minutes: float, steps: int, base_budget_seconds: float) -> None:
-        self.config_total_seconds = total_hours * 3600
-        self.early_minutes = early_minutes
-        self.steps = steps
-        self.base_budget_seconds = base_budget_seconds
-        self.setup_seconds: float = 0.0
-        self.usable_seconds: float = self.config_total_seconds
-        self.start_time: float = time.time()
-        self.final_cutoff_time: float = self.start_time + self.usable_seconds
-        self.questions_served: int = 0
-        self._cutoffs: List[int] = []
-        self.reset_after_setup(0.0)
-
-    def reset_after_setup(self, setup_seconds: float) -> None:
-        """Recompute budgets after setup to subtract loading time."""
-        self.setup_seconds = max(0.0, setup_seconds)
-        self.usable_seconds = max(0.0, self.config_total_seconds - self.setup_seconds)
-        self.start_time = time.time()
-        self.final_cutoff_time = self.start_time + self.usable_seconds
-        cutoff_array = np.linspace(
-            self.final_cutoff_time,
-            self.start_time + self.early_minutes * 60,
-            self.steps + 1,
-        )
-        cutoff_list = [int(x) for x in cutoff_array]
-        cutoff_list.pop()  # drop earliest
-        self._cutoffs = cutoff_list
-        self.questions_served = 0
-
-    def after_final_cutoff(self) -> bool:
-        return time.time() > self.final_cutoff_time
-
-    def should_downweight(self) -> bool:
-        if not self._cutoffs:
-            return True
-        return time.time() > self._cutoffs[-1]
-
-    def consume_iteration(self) -> None:
-        if self._cutoffs:
-            self._cutoffs.pop()
-        self.questions_served += 1
-
-    def question_time_budget(self, explicit_budget: Optional[float] = None) -> float:
-        """
-        Linear high-to-low budget allocation with a per-question base:
-        - Reserve base_budget_seconds for every remaining question.
-        - Distribute remaining time linearly (highest weight for the current question).
-        """
-        if explicit_budget is not None:
-            return max(float(explicit_budget), 0.0)
-
-        remaining_time = self.final_cutoff_time - time.time()
-        if remaining_time <= 0:
-            return 0.0
-
-        remaining_questions = max(len(self._cutoffs), 1)
-        base_total = self.base_budget_seconds * remaining_questions
-        extra_time = max(0.0, remaining_time - base_total)
-
-        # Linear weights: current question gets the largest share.
-        # Weights sum = n(n+1)/2; current weight = remaining_questions.
-        weight_sum = remaining_questions * (remaining_questions + 1) / 2
-        weight_current = remaining_questions
-        extra_for_current = extra_time * (weight_current / weight_sum)
-
-        budget = self.base_budget_seconds + extra_for_current
-        return max(0.0, min(budget, remaining_time))
-
-
-TIME_MANAGER = TimeManager(
-    CONFIG.timing.total_hours,
-    CONFIG.timing.early_minutes,
-    CONFIG.timing.checkpoints,
-    CONFIG.timing.base_budget_seconds,
-)
-
-
-# ============================================================
-# Utility Functions
-# ============================================================
-
-def set_random_seeds(seed: Optional[int]) -> None:
-    if seed is None:
-        return
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    set_seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def warmup_model_cache(path: str, exts: Sequence[str] = (".bin", ".pt", ".safetensors"), num_workers: Optional[int] = None, chunk_mb: int = 256) -> int:
-    """Pre-read model weight files into OS page cache."""
-    import multiprocessing
-
-    def _warmup_file(fpath: str) -> tuple[str, int]:
-        chunk_size = chunk_mb * 1024 * 1024
-        total = 0
-        with open(fpath, "rb") as f:
-            while True:
-                data = f.read(chunk_size)
-                if not data:
-                    break
-                total += len(data)
-        return fpath, total
-
-    if os.path.isdir(path):
-        files = [
-            os.path.join(root, name)
-            for root, _, names in os.walk(path)
-            for name in names
-            if name.endswith(tuple(exts))
-        ]
-        files.sort()
-    else:
-        files = [path]
-
-    if not files:
-        raise ValueError(f"No model files found under: {path}")
-
-    if num_workers is None:
-        try:
-            num_workers = min(multiprocessing.cpu_count(), 8)
-        except Exception:
-            num_workers = 4
-
-    logger.info("[cache_model] %d file(s), %d worker(s)", len(files), num_workers)
-    start = time.time()
-    total_bytes = 0
-
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        futures = {pool.submit(_warmup_file, f): f for f in files}
-        for idx, fut in enumerate(as_completed(futures), 1):
-            fpath, n = fut.result()
-            total_bytes += n
-            logger.info("[%d/%d] cached %s", idx, len(files), os.path.basename(fpath))
-
-    elapsed = time.time() - start
-    gb = total_bytes / 1024**3
-    logger.info("[cache_model] total read ≈ %.2f GB in %.2fs", gb, elapsed)
-    return total_bytes
-
-
-# ============================================================
-# Python Tool (Local Jupyter Kernel)
-# ============================================================
-
-class LocalJupyterSession:
-    """Stateful Jupyter kernel session for code execution."""
-
-    _port_lock = threading.Lock()
-    _next_port = 50000
-
-    @classmethod
-    def _get_next_ports(cls, count: int = 5) -> list[int]:
-        with cls._port_lock:
-            ports = list(range(cls._next_port, cls._next_port + count))
-            cls._next_port += count
-            return ports
-
-    def __init__(self, connection_file: str | None = None, *, timeout: float = 120.0) -> None:
-        try:
-            from jupyter_client import BlockingKernelClient, KernelManager
-        except ImportError as exc:  # pragma: no cover - dependency is expected in runtime env
-            raise RuntimeError("jupyter_client package required") from exc
-
-        self._default_timeout = timeout
-        self._owns_kernel = False
-        self._km: "KernelManager | None" = None
-
-        if connection_file:
-            connection_path = Path(connection_file).expanduser()
-            if not connection_path.exists():
-                raise FileNotFoundError(f"Connection file not found: {connection_path}")
-            client = BlockingKernelClient()
-            client.load_connection_file(str(connection_path))
-            client.start_channels()
-            client.wait_for_ready(timeout=self._default_timeout)
-            self._client = client
-        else:
-            ports = self._get_next_ports(5)
-            km = KernelManager()
-            km.shell_port = ports[0]
-            km.iopub_port = ports[1]
-            km.stdin_port = ports[2]
-            km.hb_port = ports[3]
-            km.control_port = ports[4]
-            km.start_kernel()
-            client = km.blocking_client()
-            client.start_channels()
-            client.wait_for_ready(timeout=self._default_timeout)
-            self._client = client
-            self._km = km
-            self._owns_kernel = True
-
-    def execute(self, code: str, *, timeout: float | None = None) -> str:
-        client = self._client
-        effective_timeout = timeout or self._default_timeout
-        msg_id = client.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
-
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
-
-        while True:
-            try:
-                msg = client.get_iopub_msg(timeout=effective_timeout)
-            except queue.Empty as exc:
-                raise TimeoutError("Timed out waiting for kernel output.") from exc
-
-            if msg.get("parent_header", {}).get("msg_id") != msg_id:
-                continue
-
-            msg_type = msg.get("msg_type")
-            content = msg.get("content", {})
-
-            if msg_type == "stream":
-                text = content.get("text", "")
-                if content.get("name") == "stdout":
-                    stdout_parts.append(text)
-                else:
-                    stderr_parts.append(text)
-            elif msg_type == "error":
-                traceback_data = content.get("traceback")
-                if traceback_data:
-                    stderr_parts.append("\n".join(traceback_data))
-                else:
-                    ename = content.get("ename", "")
-                    evalue = content.get("evalue", "")
-                    stderr_parts.append(f"{ename}: {evalue}".strip())
-            elif msg_type in {"execute_result", "display_data"}:
-                data = content.get("data", {})
-                text = data.get("text/plain")
-                if text:
-                    stdout_parts.append(text if text.endswith("\n") else f"{text}\n")
-            elif msg_type == "status" and content.get("execution_state") == "idle":
-                break
-
-        while True:
-            try:
-                reply = client.get_shell_msg(timeout=effective_timeout)
-            except queue.Empty as exc:
-                raise TimeoutError("Timed out waiting for execution reply.") from exc
-
-            if reply.get("parent_header", {}).get("msg_id") != msg_id:
-                continue
-
-            reply_content = reply.get("content", {})
-            if reply_content.get("status") == "error":
-                traceback_data = reply_content.get("traceback")
-                if traceback_data:
-                    stderr_parts.append("\n".join(traceback_data))
-                else:
-                    ename = reply_content.get("ename", "")
-                    evalue = reply_content.get("evalue", "")
-                    stderr_parts.append(f"{ename}: {evalue}".strip())
-            break
-
-        stdout = "".join(stdout_parts)
-        stderr = "".join(stderr_parts)
-
-        if stderr:
-            stdout = f"{stdout.rstrip()}\n{stderr}" if stdout else stderr
-
-        if not stdout.strip():
-            stdout = "[WARN] No output. Use print() to see results."
-
-        return stdout
-
-    def close(self) -> None:
-        with contextlib.suppress(Exception):
-            self._client.stop_channels()
-        if self._owns_kernel and self._km is not None:
-            with contextlib.suppress(Exception):
-                self._km.shutdown_kernel(now=True)
-
-    def __del__(self) -> None:  # pragma: no cover
-        self.close()
-
-
-class PythonTool:
-    """Python execution tool using Jupyter kernel."""
-
-    def __init__(self, local_jupyter_timeout: float = 60.0) -> None:
-        self._local_jupyter_timeout = local_jupyter_timeout
-        self._execution_lock = threading.Lock()
-        self._jupyter_session: LocalJupyterSession | None = None
-        self._init_lock = threading.Lock()
-
-    @classmethod
-    def get_tool_name(cls) -> str:
-        return "python"
-
-    @property
-    def instruction(self) -> str:
-        return "Use this tool to execute Python code. The code runs in a stateful Jupyter notebook. Use print() to see output."
-
-    @property
-    def tool_config(self) -> ToolNamespaceConfig:
-        return ToolNamespaceConfig(name=self.get_tool_name(), description=self.instruction, tools=[])
-
-    def _ensure_session(self) -> None:
-        if self._jupyter_session is None:
-            with self._init_lock:
-                if self._jupyter_session is None:
-                    self._jupyter_session = LocalJupyterSession(timeout=self._local_jupyter_timeout)
-
-    def _make_response(self, output: str, channel: str | None = None) -> Message:
-        content = TextContent(text=output)
-        author = Author(role=Role.TOOL, name=self.get_tool_name())
-        message = Message(author=author, content=[content]).with_recipient("assistant")
-        if channel:
-            message = message.with_channel(channel)
-        return message
-
-    def process_sync_plus(self, message: Message) -> list[Message]:
-        self._ensure_session()
-        script = message.content[0].text
-        with self._execution_lock:
-            try:
-                output = self._jupyter_session.execute(script)
-            except TimeoutError as exc:
-                output = f"[ERROR] {exc}"
-        return [self._make_response(output, channel=message.channel)]
-
-    def close(self) -> None:
-        if self._jupyter_session is not None:
-            self._jupyter_session.close()
-            self._jupyter_session = None
-
-    def __del__(self) -> None:  # pragma: no cover
-        self.close()
-
-
-# ============================================================
-# LMDeploy Pipeline Initialization
-# ============================================================
-
-_PIPELINE = None  # type: ignore[assignment]
+_PIPELINE = None
 
 
 def get_pipeline():
-    """Lazily initialize and return the LMDeploy pipeline."""
+    """Get or create the global LMDeploy pipeline."""
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
 
     lmdeploy_cfg = CONFIG.lmdeploy
 
-    # GPU selection
+    # Determine GPU configuration
     if lmdeploy_cfg.gpu_indices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, lmdeploy_cfg.gpu_indices))
         num_gpus = len(lmdeploy_cfg.gpu_indices)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, lmdeploy_cfg.gpu_indices))
     else:
         num_gpus = torch.cuda.device_count()
+
+    logger.info("Initializing LMDeploy with %d GPUs", num_gpus)
 
     backend_cfg = TurbomindEngineConfig(
         tp=num_gpus,
@@ -562,14 +169,90 @@ def get_pipeline():
         max_prefill_token_num=lmdeploy_cfg.max_prefill_token_num,
     )
 
-    logger.info("Initializing LMDeploy pipeline...")
-    _PIPELINE = lm_pipeline(lmdeploy_cfg.model_path, backend_cfg)
-    logger.info("LMDeploy pipeline initialized.")
+    _PIPELINE = lm_pipeline(
+        lmdeploy_cfg.model_path,
+        backend_config=backend_cfg,
+    )
+
+    logger.info("LMDeploy pipeline initialized")
     return _PIPELINE
 
 
 # ============================================================
-# Harmony TIR Inferencer
+# Time Management
+# ============================================================
+
+class TimeManager:
+    """Manages time budgets for the competition."""
+
+    def __init__(self, total_seconds: float, warmup_seconds: float = 0.0):
+        self.total_seconds = total_seconds
+        self.warmup_seconds = warmup_seconds
+        self.usable_seconds = total_seconds - warmup_seconds
+        self.start_time = time.time()
+        self.final_cutoff_time = self.start_time + total_seconds
+        self.iterations_consumed = 0
+
+    def reset_after_setup(self, setup_seconds: float) -> None:
+        """Reset timing after model setup is complete."""
+        self.start_time = time.time()
+        self.usable_seconds = self.total_seconds - setup_seconds
+        self.final_cutoff_time = self.start_time + self.usable_seconds
+
+    def question_time_budget(self) -> float:
+        """Calculate remaining time budget per question."""
+        elapsed = time.time() - self.start_time
+        remaining = max(0.0, self.usable_seconds - elapsed)
+        questions_left = max(1, 50 - self.iterations_consumed)
+        return remaining / questions_left
+
+    def consume_iteration(self) -> None:
+        """Mark one question as completed."""
+        self.iterations_consumed += 1
+
+
+TIME_MANAGER = TimeManager(
+    total_seconds=CONFIG.total_seconds,
+    warmup_seconds=CONFIG.warmup_seconds,
+)
+
+
+# ============================================================
+# Utility Functions
+# ============================================================
+
+def set_random_seeds(seed: int) -> None:
+    """Set random seeds for reproducibility."""
+    set_seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def warmup_model_cache(model_path: str, chunk_mb: int = 1024) -> None:
+    """Warmup model cache by loading model files."""
+    logger.info("Warming up model cache from %s", model_path)
+    model_dir = Path(model_path)
+    if not model_dir.exists():
+        logger.warning("Model path does not exist: %s", model_path)
+        return
+
+    for file_path in model_dir.rglob("*.safetensors"):
+        try:
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_mb * 1024 * 1024)
+                    if not chunk:
+                        break
+        except Exception as e:
+            logger.warning("Error reading %s: %s", file_path, e)
+
+    logger.info("Model cache warmup complete")
+
+
+# ============================================================
+# TIR Inferencer with Proper Token Counting
 # ============================================================
 
 class HarmonyTIRInferencer:
@@ -587,15 +270,6 @@ class HarmonyTIRInferencer:
 
         self.budget_seconds = self.gen_cfg.initial_budget_seconds
         self.render_cfg = RenderConversationConfig(auto_drop_analysis=False)
-
-        # LMDeploy generation config
-        self.lmdeploy_gen_cfg = LMDeployGenerationConfig(
-            temperature=self.gen_cfg.temperature,
-            top_p=self.gen_cfg.top_p,
-            top_k=self.gen_cfg.top_k,
-            max_new_tokens=self.gen_cfg.max_new_tokens,
-            skip_special_tokens=self.gen_cfg.skip_special_tokens,
-        )
 
     def _determine_sample_count(self, time_budget: Optional[float] = None) -> int:
         if time_budget is not None:
@@ -616,7 +290,7 @@ class HarmonyTIRInferencer:
         return ret
 
     def _apply_chat_template(self, prompt: str, python_tool: PythonTool) -> list[Message]:
-        return [
+        messages = [
             Message.from_role_and_content(
                 Role.SYSTEM,
                 SystemContent.new()
@@ -625,6 +299,15 @@ class HarmonyTIRInferencer:
             ),
             Message.from_role_and_content(Role.USER, prompt),
         ]
+
+        # Add developer instructions if configured
+        if CONFIG.prompt_list and CONFIG.prompt_list[0].user_suffix:
+            messages.insert(1, Message.from_role_and_content(
+                Role.DEVELOPER,
+                DeveloperContent.new().with_instructions(CONFIG.prompt_list[0].user_suffix)
+            ))
+
+        return messages
 
     def _trim_context(self, messages: list[Message]) -> list[Message]:
         """
@@ -658,10 +341,7 @@ class HarmonyTIRInferencer:
         for tpl in self.prompt_list:
             repeat = max(1, round(num_samples * max(1, tpl.number) / base_total))
             for _ in range(repeat):
-                if tpl.system:
-                    user_content = tpl.system + "\n" + problem + tpl.user_suffix
-                else:
-                    user_content = problem + tpl.user_suffix
+                user_content = problem
                 prompts.append(user_content)
         return prompts[:num_samples]
 
@@ -696,105 +376,153 @@ class HarmonyTIRInferencer:
         result_queue: queue.Queue,
     ) -> None:
         """
-        Worker function that handles a single sample generation.
-        Generates with tool config for Harmony protocol format, but doesn't parse/execute tools.
+        Worker function that handles a single sample through multiple TIR iterations.
+        Each sample can independently execute Python tools and continue generation.
+
+        FIXED: Proper token counting across all iterations.
         """
+        python_tool = None
         try:
-            # Create tool config for proper Harmony protocol format
             python_tool = PythonTool(local_jupyter_timeout=self.tool_cfg.local_jupyter_timeout)
-            tool_config = python_tool.tool_config
+            messages = self._apply_chat_template(prompt, python_tool)
 
-            # Render prompt with tool configuration
-            messages = [
-                Message.from_role_and_content(
-                    Role.SYSTEM,
-                    SystemContent.new()
-                    .with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
-                    .with_tools(tool_config),
-                ),
-                Message.from_role_and_content(Role.USER, prompt),
-            ]
-
-            prompt_ids = self.encoding.render_conversation_for_completion(
-                Conversation.from_messages(messages),
-                Role.ASSISTANT,
-            )
-            prompt_str = self.encoding.decode_utf8(prompt_ids)
+            # Initialize tracking variables OUTSIDE iteration loop
+            total_token_count = 0  # Accumulates across ALL iterations
+            finish_reason = ""
+            final_answer = None
+            final_answer_found = False
 
             pipe = get_pipeline()
 
-            max_tokens = self.lmdeploy_cfg.session_len - len(prompt_ids)
-            if max_tokens < 1:
-                logger.warning("Sample %d: Context full", sample_idx)
-                result_queue.put(("complete", sample_idx, "", 0, "context_full", None))
-                return
-
-            gen_cfg = LMDeployGenerationConfig(
-                temperature=self.gen_cfg.temperature,
-                top_p=self.gen_cfg.top_p,
-                top_k=self.gen_cfg.top_k,
-                max_new_tokens=min(max_tokens, self.gen_cfg.max_new_tokens),
-                skip_special_tokens=self.gen_cfg.skip_special_tokens,
-                stop_token_ids=self.stop_token_ids,  # Harmony protocol stop tokens
-            )
-
-            token_buffer_str = ""
-            token_buffer_ids = []  # Track raw token IDs
-            finish_reason = ""
-            final_answer = None
-
-            # Stream generation for this sample
-            for resp in pipe.stream_infer(
-                prompts=[prompt_str],
-                gen_config=gen_cfg,
-                do_preprocess=False,
-            ):
-                if stop_event.is_set():
-                    finish_reason = "stop_event"
-                    break
-
-                # Accumulate raw token IDs
-                if resp.token_ids:
-                    token_buffer_ids.extend(resp.token_ids)
-                    # Decode using base tokenizer without channel filtering
-                    token_buffer_str = pipe.tokenizer.decode(token_buffer_ids, skip_special_tokens=False)
-
+            for iteration in range(self.gen_cfg.max_iter):
+                # Check termination conditions
                 if self._deadline and time.time() >= self._deadline:
+                    logger.warning("Sample %d: Deadline reached", sample_idx)
                     finish_reason = "deadline"
                     break
 
-                # Use actual accumulated token count, not resp.generate_token_len
-                if len(token_buffer_ids) > self.gen_cfg.token_limit:
-                    logger.warning("Sample %d: Token limit exceeded", sample_idx)
-                    finish_reason = "token_limit"
+                if final_answer_found or (stop_event and stop_event.is_set()):
+                    if not finish_reason:
+                        finish_reason = "stop_event" if stop_event and stop_event.is_set() else "boxed"
                     break
 
-                # Check for boxed answer
-                if "}" in resp.text:
-                    candidate = self.extract_boxed_text(token_buffer_str)
-                    if candidate is not None:
-                        final_answer = candidate
-                        finish_reason = "boxed"
-                        # Notify via queue immediately
-                        result_queue.put(("answer", sample_idx, candidate))
+                # Render conversation to prompt
+                prompt_ids = self.encoding.render_conversation_for_completion(
+                    Conversation.from_messages(messages),
+                    Role.ASSISTANT,
+                )
+                prompt_str = self.encoding.decode_utf8(prompt_ids)
+
+                max_tokens = self.lmdeploy_cfg.session_len - len(prompt_ids)
+                if max_tokens < 1:
+                    logger.warning("Sample %d: Context full at iteration %d", sample_idx, iteration)
+                    finish_reason = "context_full"
+                    break
+
+                gen_cfg = LMDeployGenerationConfig(
+                    temperature=self.gen_cfg.temperature,
+                    top_p=self.gen_cfg.top_p,
+                    top_k=self.gen_cfg.top_k,
+                    max_new_tokens=min(max_tokens, self.gen_cfg.max_new_tokens),
+                    skip_special_tokens=self.gen_cfg.skip_special_tokens,
+                    stop_token_ids=self.stop_token_ids,
+                )
+
+                # Token buffer for THIS iteration only
+                token_buffer: list[int] = []
+                token_buffer_str = ""
+                breaking = False
+
+                # Stream generation for this iteration
+                for resp in pipe.stream_infer(
+                    prompts=[prompt_str],
+                    gen_config=gen_cfg,
+                    do_preprocess=False,
+                ):
+                    if stop_event.is_set():
+                        breaking = True
+                        finish_reason = "stop_event"
                         break
 
+                    # Accumulate tokens for this iteration
+                    if resp.token_ids:
+                        token_buffer.extend(resp.token_ids)
+                        token_buffer_str = pipe.tokenizer.decode(token_buffer, skip_special_tokens=False)
+
+                    if self._deadline and time.time() >= self._deadline:
+                        finish_reason = "deadline"
+                        breaking = True
+                        break
+
+                    # Check TOTAL token limit (across all iterations)
+                    if total_token_count + len(token_buffer) > self.gen_cfg.token_limit:
+                        logger.warning("Sample %d: Token limit exceeded (total: %d)",
+                                     sample_idx, total_token_count + len(token_buffer))
+                        finish_reason = "token_limit"
+                        breaking = True
+                        break
+
+                    # Check for boxed answer
+                    if "}" in resp.text:
+                        candidate = self.extract_boxed_text(token_buffer_str)
+                        if candidate is not None:
+                            final_answer = candidate
+                            finish_reason = "boxed"
+                            final_answer_found = True
+                            # Notify immediately
+                            result_queue.put(("answer", sample_idx, candidate))
+                            breaking = True
+                            break
+
+                # Add this iteration's tokens to total count
+                total_token_count += len(token_buffer)
+
+                if breaking:
+                    break
+
+                # Parse messages from this iteration's output
+                if token_buffer:
+                    new_messages = self.encoding.parse_messages_from_completion_tokens(
+                        token_buffer, Role.ASSISTANT
+                    )
+                    messages.extend(new_messages)
+                    messages = self._trim_context(messages)
+
+                    last_message = messages[-1]
+
+                    # Check if stream ended naturally
+                    if last_message.channel == "final" or (token_buffer and token_buffer[-1] == 200002):
+                        if not finish_reason:
+                            finish_reason = "stream_end"
+                        break
+
+                    # Execute Python tool if requested (independent of other samples)
+                    if last_message.recipient == "python":
+                        logger.info("Sample %d iteration %d: Executing Python tool...", sample_idx, iteration)
+                        response_msgs = python_tool.process_sync_plus(last_message)
+                        messages.extend(response_msgs)
+                        # Continue to next iteration
+
+            # Set final reason if not already set
             if not finish_reason:
-                finish_reason = "completed"
+                finish_reason = "max_iter" if iteration + 1 >= self.gen_cfg.max_iter else "unknown"
 
-            # Use actual token count from accumulated IDs
-            actual_token_count = len(token_buffer_ids)
+            # Render final conversation
+            all_text = self.encoding.decode_utf8(
+                self.encoding.render_conversation_for_training(
+                    Conversation.from_messages(messages),
+                    self.render_cfg,
+                )
+            )
 
-            # Send final result with actual token count
-            result_queue.put(("complete", sample_idx, token_buffer_str, actual_token_count, finish_reason, final_answer))
-
-            # Cleanup
-            python_tool.close()
+            # Send completion with accurate total token count
+            result_queue.put(("complete", sample_idx, all_text, total_token_count, finish_reason, final_answer))
 
         except Exception as exc:
             logger.exception("Sample %d: Error in generation: %s", sample_idx, exc)
             result_queue.put(("complete", sample_idx, "", 0, "error", None))
-            if 'python_tool' in locals():
+        finally:
+            if python_tool:
                 python_tool.close()
 
     def _inference_parallel(self, prompts: list[str]) -> tuple[list[str], list[int], list[str]]:
@@ -807,11 +535,13 @@ class HarmonyTIRInferencer:
         raw_responses = [""] * len(prompts)
         token_lens = [0] * len(prompts)
         finish_reasons = [""] * len(prompts)
-        majority_threshold = len(prompts) * self.gen_cfg.majority_threshold
+
+        # FIXED: Calculate actual threshold (not using float directly)
+        majority_threshold = int(len(prompts) * self.gen_cfg.majority_threshold)
         majority_reached = False
 
         logger.info(
-            "Sampling %d times (threshold: > %.2f, cfg=%.2f)...",
+            "Sampling %d times (threshold: >= %d, cfg=%.2f)...",
             len(prompts),
             majority_threshold,
             self.gen_cfg.majority_threshold,
@@ -844,13 +574,13 @@ class HarmonyTIRInferencer:
 
                 if result[0] == "answer":
                     # Intermediate answer found
-                    _, sample_idx, answer = result
-                    answers_collected.append(answer)
+                    _, sample_idx, ans = result  # FIXED: Use 'ans' not 'answer'
+                    answers_collected.append(ans)
 
                     # Check for majority
                     counts = Counter(answers_collected)
                     most_common_ans, count = counts.most_common(1)[0]
-                    if count > majority_threshold:
+                    if count >= majority_threshold:  # FIXED: Use >= instead of >
                         logger.info(
                             "Majority reached: %s appeared %d times",
                             most_common_ans,
@@ -870,6 +600,18 @@ class HarmonyTIRInferencer:
                     # Add final answer if not already added
                     if final_ans is not None and final_ans not in answers_collected:
                         answers_collected.append(final_ans)
+
+                        # Check for majority again
+                        counts = Counter(answers_collected)
+                        most_common_ans, count = counts.most_common(1)[0]
+                        if count >= majority_threshold:
+                            logger.info(
+                                "Majority reached: %s appeared %d times",
+                                most_common_ans,
+                                count,
+                            )
+                            majority_reached = True
+                            stop_event.set()
 
                     completed_count += 1
 
@@ -928,7 +670,7 @@ INFERENCER = HarmonyTIRInferencer(CONFIG)
 
 
 # ============================================================
-# Prediction Tracking
+# Prediction Tracker
 # ============================================================
 
 @dataclass
@@ -1019,16 +761,6 @@ def predict(
 
     logger.info("=" * 60)
     logger.info("Question ID: %s", question_id)
-    logger.info("Question: %s", question_text)
-    logger.info("=" * 60)
-
-    if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
-        logger.info("Rerun mode detected, returning dummy prediction.")
-        return pl.DataFrame({"id": question_id, "answer": 0})
-
-    if TIME_MANAGER.after_final_cutoff():
-        logger.warning("Final cutoff exceeded; returning default answer 0.")
-        return pl.DataFrame({"id": question_id, "answer": 0})
 
     question_budget = TIME_MANAGER.question_time_budget()
     deadline = min(time.time() + question_budget, TIME_MANAGER.final_cutoff_time)
@@ -1078,10 +810,18 @@ def predict(
 # Dataset Preparation
 # ============================================================
 
-def prepare_reference_dataset(cfg: DatasetConfig) -> Dict[str | int, int]:
-    df = pd.read_csv(cfg.reference_csv)
-    ground_truth = dict(zip(df["id"], df["answer"])) if "answer" in df.columns else {}
-    df.drop("answer", axis=1, errors="ignore").to_csv(cfg.submission_csv, index=False)
+def prepare_reference_dataset(cfg) -> Dict[str | int, int]:
+    """Prepare reference dataset with ground truth answers."""
+    if not Path(cfg.submission_csv).exists():
+        logger.warning("Submission CSV not found: %s", cfg.submission_csv)
+        return {}
+
+    df = pl.read_csv(cfg.submission_csv)
+    if "answer" not in df.columns:
+        logger.warning("No 'answer' column in submission CSV")
+        return {}
+
+    ground_truth = {row["id"]: row["answer"] for row in df.iter_rows(named=True)}
     logger.info("Prepared reference dataset at %s (ground truth available: %s)", cfg.submission_csv, bool(ground_truth))
     return ground_truth
 
@@ -1122,7 +862,7 @@ def main() -> None:
     inference_server.run_local_gateway((CONFIG.dataset.submission_csv,))
 
     # Save metrics to file
-    metrics_file = "prediction_metrics.json"
+    metrics_file = "prediction_metrics_tir.json"
     if PREDICTION_TRACKER.total > 0:
         PREDICTION_TRACKER.save_to_file(metrics_file)
 
