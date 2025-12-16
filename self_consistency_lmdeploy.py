@@ -556,8 +556,6 @@ class HarmonyTIRInferencer:
                     if self._deadline and time.time() >= self._deadline:
                         finish_reason = "deadline"
                         breaking = True
-                        # Stop current session immediately, don't wait for _stop_all_sessions
-                        # which will be called by the coordinator thread
                         break
 
                     if len(token_buffer) > self.gen_cfg.token_limit:
@@ -576,11 +574,10 @@ class HarmonyTIRInferencer:
                 # Add tokens from this iteration to total count
                 token_count += iteration_token_count
 
-                # Only stop session if breaking early (not natural stream end)
-                # Natural stream end is handled by LMDeploy automatically
+                # Stop the generation session if still active
+                self._stop_session(pipe, session_id, timeout=0.5)
+
                 if breaking:
-                    if finish_reason in {"stop_event", "deadline", "token_limit"}:
-                        self._stop_session(pipe, session_id, timeout=0.5)
                     break
 
                 # Check stop_event before processing messages
