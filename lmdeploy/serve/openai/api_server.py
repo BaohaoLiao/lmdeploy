@@ -555,6 +555,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             if res.cache_block_ids is not None:
                 response_json['cache_block_ids'] = res.cache_block_ids
                 response_json['remote_token_ids'] = res.token_ids
+            if res.decode_order is not None:
+                response_json['decode_order'] = res.decode_order
             yield f'data: {response_json}\n\n'
         yield 'data: [DONE]\n\n'
 
@@ -569,6 +571,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     text = ''
     cache_block_ids = []
     remote_token_ids = []
+    decode_order = None
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
@@ -582,6 +585,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             final_logprobs.extend(res.logprobs)
         cache_block_ids.append(res.cache_block_ids)
         remote_token_ids.append(res.token_ids)
+        if res.decode_order is not None:
+            decode_order = res.decode_order
 
     if gpt_oss_parser:
         message = gpt_oss_parser.parse_full(final_token_ids)
@@ -650,6 +655,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     if with_cache:
         response['cache_block_ids'] = cache_block_ids
         response['remote_token_ids'] = remote_token_ids
+    if decode_order is not None:
+        response['decode_order'] = decode_order
 
     return response
 
@@ -820,6 +827,8 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
                 if res.cache_block_ids is not None:
                     response_json['cache_block_ids'] = res.cache_block_ids
                     response_json['remote_token_ids'] = res.token_ids
+                if res.decode_order is not None:
+                    response_json['decode_order'] = res.decode_order
                 yield f'data: {json.dumps(response_json)}\n\n'
         yield 'data: [DONE]\n\n'
 
@@ -832,9 +841,10 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
     choices = [None] * len(generators)
     cache_block_ids = []
     remote_token_ids = []
+    decode_order = None
 
     async def _inner_call(i, generator):
-        nonlocal cache_block_ids, remote_token_ids
+        nonlocal cache_block_ids, remote_token_ids, decode_order
         final_logprobs = []
         final_token_ids = []
         final_res = None
@@ -848,6 +858,8 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
             text += res.response
             cache_block_ids.append(res.cache_block_ids)
             remote_token_ids.append(res.token_ids)
+            if res.decode_order is not None:
+                decode_order = res.decode_order
             if res.token_ids:
                 final_token_ids.extend(res.token_ids)
             if res.logprobs:
@@ -892,6 +904,8 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
     if with_cache:
         response['cache_block_ids'] = cache_block_ids
         response['remote_token_ids'] = remote_token_ids
+    if decode_order is not None:
+        response['decode_order'] = decode_order
 
     return response
 
